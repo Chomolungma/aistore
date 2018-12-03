@@ -9,6 +9,7 @@ from boto.s3.key import Key
 import time
 import json
 import urllib2
+import ConfigParser
 from timeout import timeout
 
 # Global vars assigned from the config in load_global_defaults
