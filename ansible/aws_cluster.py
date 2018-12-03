@@ -40,8 +40,6 @@ def load_global_defaults():
     c.read(conf_path)
     AWS_AK = c.get('aws_defaults', 'ak')
     AWS_SAK = c.get('aws_defaults', 'sak')
-    print AWS_AK
-    print AWS_SAK
     
 # Load global defaults
 load_global_defaults()
