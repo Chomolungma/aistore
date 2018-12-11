@@ -8,6 +8,7 @@ ssh $(head -1 inventory/targets.txt) 'sudo tar czf /tmp/devtest_$(hostname)_$(da
 mkdir logs
 scp $(head -1 inventory/targets.txt):/tmp/*.tar.gz logs/
 echo DevTest logs are copied here 
+pwd
 ls -al logs
 
 exit $EXIT_STATUS
