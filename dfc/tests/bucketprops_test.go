@@ -14,20 +14,11 @@ import (
 
 func testBucketProps(t *testing.T) *cmn.BucketProps {
 	proxyURL := getPrimaryURL(t, proxyURLRO)
-	globalConfig := getConfig(proxyURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
-	lruConfig := globalConfig["lru_config"].(map[string]interface{})
+	globalConfig := getDaemonConfig(t, proxyURL)
 
-	LRUConf := cmn.LRUConfig{
-		LowWM:              uint32(lruConfig["lowwm"].(float64)),
-		HighWM:             uint32(lruConfig["highwm"].(float64)),
-		AtimeCacheMax:      uint64(lruConfig["atime_cache_max"].(float64)),
-		DontEvictTimeStr:   lruConfig["dont_evict_time"].(string),
-		CapacityUpdTimeStr: lruConfig["capacity_upd_time"].(string),
-		LRUEnabled:         lruConfig["lru_enabled"].(bool),
-	}
 	return &cmn.BucketProps{
-		CksumConfig: cmn.CksumConfig{Checksum: cmn.ChecksumInherit},
-		LRUConfig:   LRUConf,
+		CksumConf: cmn.CksumConf{Checksum: cmn.ChecksumInherit},
+		LRUConf:   globalConfig.LRU,
 	}
 }
 
@@ -35,8 +26,7 @@ func TestResetBucketProps(t *testing.T) {
 	var (
 		proxyURL     = getPrimaryURL(t, proxyURLRO)
 		globalProps  cmn.BucketProps
-		globalConfig = getConfig(proxyURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
-		cksumConfig  = globalConfig["cksum_config"].(map[string]interface{})
+		globalConfig = getDaemonConfig(t, proxyURL)
 	)
 
 	createFreshLocalBucket(t, proxyURL, TestLocalBucketName)
@@ -48,24 +38,21 @@ func TestResetBucketProps(t *testing.T) {
 	bucketProps.EnableReadRangeChecksum = true
 
 	globalProps.CloudProvider = cmn.ProviderDFC
-	globalProps.Checksum = cksumConfig["checksum"].(string)
-	globalProps.ValidateColdGet = cksumConfig["validate_checksum_cold_get"].(bool)
-	globalProps.ValidateWarmGet = cksumConfig["validate_checksum_warm_get"].(bool)
-	globalProps.EnableReadRangeChecksum = cksumConfig["enable_read_range_checksum"].(bool)
-	globalProps.LRUConfig = testBucketProps(t).LRUConfig
+	globalProps.CksumConf = globalConfig.Cksum
+	globalProps.LRUConf = testBucketProps(t).LRUConf
 
-	err := api.SetBucketProps(tutils.HTTPClient, proxyURL, TestLocalBucketName, bucketProps)
+	err := api.SetBucketProps(tutils.DefaultBaseAPIParams(t), TestLocalBucketName, bucketProps)
 	tutils.CheckFatal(err, t)
 
-	p, err := api.HeadBucket(tutils.HTTPClient, proxyURL, TestLocalBucketName)
+	p, err := api.HeadBucket(tutils.DefaultBaseAPIParams(t), TestLocalBucketName)
 	tutils.CheckFatal(err, t)
 
 	// check that bucket props do get set
 	validateBucketProps(t, bucketProps, *p)
-	err = api.ResetBucketProps(tutils.HTTPClient, proxyURL, TestLocalBucketName)
+	err = api.ResetBucketProps(tutils.DefaultBaseAPIParams(t), TestLocalBucketName)
 	tutils.CheckFatal(err, t)
 
-	p, err = api.HeadBucket(tutils.HTTPClient, proxyURL, TestLocalBucketName)
+	p, err = api.HeadBucket(tutils.DefaultBaseAPIParams(t), TestLocalBucketName)
 	tutils.CheckFatal(err, t)
 
 	// check that bucket props are reset
@@ -82,8 +69,7 @@ func TestSetBucketNextTierURLInvalid(t *testing.T) {
 	createFreshLocalBucket(t, proxyURL, TestLocalBucketName)
 	defer destroyLocalBucket(t, proxyURL, TestLocalBucketName)
 
-	smap, err := tutils.GetClusterMap(proxyURL)
-	tutils.CheckFatal(err, t)
+	smap := getClusterMap(t, proxyURL)
 
 	if len(smap.Tmap) < 1 || len(smap.Pmap) < 1 {
 		t.Fatal("This test requires there to be at least one target and one proxy in the current cluster")
@@ -113,7 +99,7 @@ func TestSetBucketNextTierURLInvalid(t *testing.T) {
 
 	for _, url := range invalidDaemonURLs {
 		bucketProps.NextTierURL = url
-		if err = api.SetBucketProps(tutils.HTTPClient, proxyURL, TestLocalBucketName, bucketProps); err == nil {
+		if err := api.SetBucketProps(tutils.DefaultBaseAPIParams(t), TestLocalBucketName, bucketProps); err == nil {
 			t.Fatalf("Setting the bucket's nextTierURL to daemon %q should fail, it is in the current cluster.", url)
 		}
 	}

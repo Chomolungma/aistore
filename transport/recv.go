@@ -1,13 +1,8 @@
+// Package transport provides streaming object-based transport over http for intra-cluster continuous
+// intra-cluster communications (see README for details and usage example).
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-//
-// Package transport provides streaming object-based transport over http for
-// massive intra-DFC or DFC-to-DFC data transfers.
-//
-// See README for details and usage examples.
-//
 package transport
 
 import (
@@ -30,7 +25,7 @@ import (
 // API types
 //
 type (
-	Receive func(w http.ResponseWriter, hdr Header, object io.Reader)
+	Receive func(w http.ResponseWriter, hdr Header, object io.Reader, err error)
 )
 
 // internal types
@@ -44,7 +39,6 @@ type (
 		body io.ReadCloser
 		hdr  Header
 		off  int64
-		hlen int
 	}
 	handler struct {
 		trname      string
@@ -68,7 +62,6 @@ var (
 	mu       *sync.Mutex
 	debug    bool
 )
-var knownNetworks = []string{cmn.NetworkPublic, cmn.NetworkIntraControl, cmn.NetworkIntraData}
 
 func init() {
 	mu = &sync.Mutex{}
@@ -82,8 +75,8 @@ func init() {
 //
 
 func SetMux(network string, x *http.ServeMux) {
-	if !cmn.StringInSlice(network, knownNetworks) {
-		glog.Warningf("unknown network: %s, expected one of: %v", network, knownNetworks)
+	if !cmn.NetworkIsKnown(network) {
+		glog.Warningf("Unknown network %s, expecting one of: %v", network, cmn.KnownNetworks)
 	}
 	mu.Lock()
 	muxers[network] = x
@@ -184,14 +177,20 @@ func (h *handler) receive(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if objReader != nil {
-			h.callback(w, objReader.hdr, objReader)
+			h.callback(w, objReader.hdr, objReader, nil)
 			num := atomic.AddInt64(&stats.Num, 1)
-			siz := atomic.AddInt64(&stats.Size, objReader.hdr.Dsize)
-			off := atomic.AddInt64(&stats.Offset, objReader.hdr.Dsize)
-			if bool(glog.V(4)) || debug {
-				glog.Infof("%s[%d]: offset=%d, size=%d, num=%d", trname, sessid, off, siz, num)
+			if objReader.hdr.Dsize != objReader.off {
+				err = fmt.Errorf("%s[%d]: stream breakage type #3: reader offset %d != %d object size, num=%d",
+					trname, sessid, objReader.off, objReader.hdr.Dsize, num)
+				glog.Errorln(err)
+			} else {
+				siz := atomic.AddInt64(&stats.Size, objReader.hdr.Dsize)
+				off := atomic.AddInt64(&stats.Offset, objReader.hdr.Dsize)
+				if bool(glog.V(4)) || debug {
+					glog.Infof("%s[%d]: offset=%d, size=%d(%d), num=%d", trname, sessid, off, siz, objReader.hdr.Dsize, num)
+				}
+				continue
 			}
-			continue
 		}
 		if err != nil {
 			if sessid != 0 {
@@ -209,6 +208,7 @@ func (h *handler) receive(w http.ResponseWriter, r *http.Request) {
 				h.oldSessions.Store(sessid, time.Now())
 			}
 			if err != io.EOF {
+				h.callback(w, Header{}, nil, err)
 				cmn.InvalidHandlerDetailed(w, r, err.Error())
 			}
 			return

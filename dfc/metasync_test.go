@@ -82,10 +82,13 @@ func newPrimary() *proxyrunner {
 	smap.ProxySI = p.si
 	p.smapowner.put(smap)
 
+	config := cmn.GCO.BeginUpdate()
+	config.Periodic.RetrySyncTime = time.Millisecond * 100
+	config.KeepaliveTracker.Proxy.Name = "heartbeat"
+	config.KeepaliveTracker.Proxy.IntervalStr = "as"
+	cmn.GCO.CommitUpdate(config)
+
 	p.httpclientLongTimeout = &http.Client{}
-	ctx.config.Periodic.RetrySyncTime = time.Millisecond * 100
-	ctx.config.KeepaliveTracker.Proxy.Name = "heartbeat"
-	ctx.config.KeepaliveTracker.Proxy.IntervalStr = "as"
 	p.keepalive = newProxyKeepaliveRunner(&p)
 
 	p.bmdowner = &bmdowner{}
@@ -134,26 +137,26 @@ func newTransportServer(primary *proxyrunner, s *metaSyncServer, ch chan<- trans
 
 func TestMetaSyncDeepCopy(t *testing.T) {
 	bucketmd := newBucketMD()
-	bucketmd.add("bucket1", true, cmn.BucketProps{
+	bucketmd.add("bucket1", true, &cmn.BucketProps{
 		CloudProvider: cmn.ProviderDFC,
 		NextTierURL:   "http://foo.com",
-		CksumConfig: cmn.CksumConfig{
+		CksumConf: cmn.CksumConf{
 			Checksum: cmn.ChecksumInherit,
 		},
 	})
-	bucketmd.add("bucket2", true, cmn.BucketProps{
-		CksumConfig: cmn.CksumConfig{
+	bucketmd.add("bucket2", true, &cmn.BucketProps{
+		CksumConf: cmn.CksumConf{
 			Checksum: cmn.ChecksumInherit,
 		},
 	})
-	bucketmd.add("bucket3", false, cmn.BucketProps{
+	bucketmd.add("bucket3", false, &cmn.BucketProps{
 		CloudProvider: cmn.ProviderDFC,
-		CksumConfig: cmn.CksumConfig{
+		CksumConf: cmn.CksumConf{
 			Checksum: cmn.ChecksumInherit,
 		},
 	})
-	bucketmd.add("bucket4", false, cmn.BucketProps{
-		CksumConfig: cmn.CksumConfig{
+	bucketmd.add("bucket4", false, &cmn.BucketProps{
+		CksumConf: cmn.CksumConf{
 			Checksum: cmn.ChecksumInherit,
 		},
 	})
@@ -191,7 +194,7 @@ func TestMetaSyncTransport(t *testing.T) {
 
 	for _, tc := range tcs {
 		primary := newPrimary()
-		syncer := newmetasyncer(primary)
+		syncer := testSyncer(primary)
 
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -471,7 +474,7 @@ func TestMetaSyncData(t *testing.T) {
 			}
 
 			d := make(map[string]string)
-			err := primary.readJSON(w, r, &d)
+			err := cmn.ReadJSON(w, r, &d)
 			ch <- data{d, err}
 		}
 
@@ -515,7 +518,7 @@ func TestMetaSyncData(t *testing.T) {
 		exp            = make(map[string]string)
 		expRetry       = make(map[string]string)
 		primary        = newPrimary()
-		syncer         = newmetasyncer(primary)
+		syncer         = testSyncer(primary)
 		ch             = make(chan data, 5)
 		bucketmd       = newBucketMD()
 		emptyActionMsg string
@@ -557,16 +560,16 @@ func TestMetaSyncData(t *testing.T) {
 	match(t, expRetry, ch, 1)
 
 	// sync bucketmd, fail target and retry
-	bucketmd.add("bucket1", true, cmn.BucketProps{
+	bucketmd.add("bucket1", true, &cmn.BucketProps{
 		CloudProvider: cmn.ProviderDFC,
-		CksumConfig: cmn.CksumConfig{
+		CksumConf: cmn.CksumConf{
 			Checksum: cmn.ChecksumInherit,
 		},
 	})
-	bucketmd.add("bucket2", true, cmn.BucketProps{
+	bucketmd.add("bucket2", true, &cmn.BucketProps{
 		CloudProvider: cmn.ProviderDFC,
 		NextTierURL:   "http://localhost:8082",
-		CksumConfig: cmn.CksumConfig{
+		CksumConf: cmn.CksumConf{
 			Checksum: cmn.ChecksumInherit,
 		},
 	})
@@ -587,9 +590,9 @@ func TestMetaSyncData(t *testing.T) {
 	// sync bucketmd, fail proxy, sync new bucketmd, expect proxy to receive the new bucketmd
 	// after rejecting a few sync requests
 	bucketmd = bucketmd.clone()
-	bprops := cmn.BucketProps{
-		CksumConfig: cmn.CksumConfig{Checksum: cmn.ChecksumInherit},
-		LRUConfig:   ctx.config.LRU,
+	bprops := &cmn.BucketProps{
+		CksumConf: cmn.CksumConf{Checksum: cmn.ChecksumInherit},
+		LRUConf:   cmn.GCO.Get().LRU,
 	}
 	bucketmd.add("bucket3", true, bprops)
 	b, err = bucketmd.marshal()
@@ -606,7 +609,7 @@ func TestMetaSyncMembership(t *testing.T) {
 	{
 		// pending server dropped without sync
 		primary := newPrimary()
-		syncer := newmetasyncer(primary)
+		syncer := testSyncer(primary)
 
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -647,7 +650,7 @@ func TestMetaSyncMembership(t *testing.T) {
 	}
 
 	primary := newPrimary()
-	syncer := newmetasyncer(primary)
+	syncer := testSyncer(primary)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -735,7 +738,7 @@ func TestMetaSyncReceive(t *testing.T) {
 		}
 
 		primary := newPrimary()
-		syncer := newmetasyncer(primary)
+		syncer := testSyncer(primary)
 
 		var wg sync.WaitGroup
 		wg.Add(1)
@@ -747,7 +750,7 @@ func TestMetaSyncReceive(t *testing.T) {
 		chProxy := make(chan map[string]string, 10)
 		fProxy := func(w http.ResponseWriter, r *http.Request) {
 			d := make(map[string]string)
-			primary.readJSON(w, r, &d) // ignore json error
+			cmn.ReadJSON(w, r, &d) // ignore json error
 			chProxy <- d
 		}
 
@@ -786,4 +789,9 @@ func TestMetaSyncReceive(t *testing.T) {
 		emptyActionMsg(actMsg)
 		nilSMap(newSMap)
 	}
+}
+
+func testSyncer(p *proxyrunner) (syncer *metasyncer) {
+	syncer = newmetasyncer(p)
+	return
 }

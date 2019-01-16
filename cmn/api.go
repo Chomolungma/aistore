@@ -1,9 +1,7 @@
+// Package cmn provides common low-level types and utilities for all dfcpub projects
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-
-// Package cmn provides common low-level types and utilities for all dfcpub projects
 package cmn
 
 import (
@@ -62,6 +60,8 @@ const (
 	ActNewPrimary  = "newprimary"
 	ActRevokeToken = "revoketoken"
 	ActElection    = "election"
+	ActPutLR       = "putlreplica"
+	ActReLR        = "manlreplica"
 
 	// Actions for manipulating mountpaths (/v1/daemon/mountpaths)
 	ActMountpathEnable  = "enable"
@@ -125,6 +125,11 @@ const (
 	URLParamBMDVersion       = "vbm" // version of the bucket-metadata
 	URLParamUnixTime         = "utm" // Unix time: number of nanoseconds elapsed since 01/01/70 UTC
 	URLParamReadahead        = "rah" // Proxy to target: readeahed
+
+	// dsort
+	URLParamTotalCompressedSize   = "tcs"
+	URLParamTotalUncompressedSize = "tunc"
+	URLParamTotalInputShardsSeen  = "tiss"
 )
 
 // TODO: sort and some props are TBD
@@ -285,6 +290,15 @@ const (
 	Voteres    = "result"
 	VoteInit   = "init"
 	Mountpaths = "mountpaths"
+
+	// dsort
+	Init    = "init"
+	Sort    = "sort"
+	Start   = "start"
+	Abort   = "abort"
+	Metrics = "metrics"
+	Records = "records"
+	Shards  = "shards"
 )
 
 const (
@@ -301,54 +315,6 @@ const (
 	RWPolicyCloud    = "cloud"
 	RWPolicyNextTier = "next_tier"
 )
-
-type CksumConfig struct {
-
-	// Checksum: hashing algorithm used to check for object corruption
-	// Values: none, xxhash, md5, inherit
-	// Value of 'none' disables hash checking
-	Checksum string `json:"checksum"`
-
-	// ValidateColdGet determines whether or not the checksum of received object
-	// is checked after downloading it from the cloud or next tier
-	ValidateColdGet bool `json:"validate_checksum_cold_get"`
-
-	// ValidateWarmGet: if enabled, the object's version (if in Cloud-based bucket)
-	// and checksum are checked. If either value fail to match, the object
-	// is removed from local storage
-	ValidateWarmGet bool `json:"validate_checksum_warm_get"`
-
-	// EnableReadRangeChecksum: Return read range checksum otherwise return entire object checksum
-	EnableReadRangeChecksum bool `json:"enable_read_range_checksum"`
-}
-
-type LRUConfig struct {
-
-	// LowWM: Self-throttling mechanisms are suspended if disk utilization is below LowWM
-	LowWM uint32 `json:"lowwm"`
-
-	// HighWM: Self-throttling mechanisms are fully engaged if disk utilization is above HighWM
-	HighWM uint32 `json:"highwm"`
-
-	// AtimeCacheMax represents the maximum number of entries
-	AtimeCacheMax uint64 `json:"atime_cache_max"`
-
-	// DontEvictTimeStr denotes the period of time during which eviction of an object
-	// is forbidden [atime, atime + DontEvictTime]
-	DontEvictTimeStr string `json:"dont_evict_time"`
-
-	// DontEvictTime is the parsed value of DontEvictTimeStr
-	DontEvictTime time.Duration `json:"-"`
-
-	// CapacityUpdTimeStr denotes the frequency with which DFC updates filesystem usage
-	CapacityUpdTimeStr string `json:"capacity_upd_time"`
-
-	// CapacityUpdTime is the parsed value of CapacityUpdTimeStr
-	CapacityUpdTime time.Duration `json:"-"`
-
-	// LRUEnabled: LRU will only run when set to true
-	LRUEnabled bool `json:"lru_enabled"`
-}
 
 // BucketProps defines the configuration of the bucket with regard to
 // its type, checksum, and LRU. These characteristics determine its behaviour
@@ -377,9 +343,15 @@ type BucketProps struct {
 	// specified by NextTierURL. Default: "cloud"
 	WritePolicy string `json:"write_policy,omitempty"`
 
-	// CksumConfig is the embedded struct of the same name
-	CksumConfig `json:"cksum_config"`
+	// CksumConf is the embedded struct of the same name
+	CksumConf `json:"cksum_config"`
 
-	// LRUConfig is the embedded struct of the same name
-	LRUConfig `json:"lru_props"`
+	// LRUConf is the embedded struct of the same name
+	LRUConf `json:"lru_props"`
+}
+
+// ObjectProps
+type ObjectProps struct {
+	Size    int
+	Version string
 }

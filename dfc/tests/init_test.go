@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/NVIDIA/dfcpub/dfc"
 	"github.com/NVIDIA/dfcpub/tutils"
 )
 
@@ -30,9 +29,11 @@ const (
 	DeleteStr               = "delete"
 	SmokeDir                = "/tmp/dfc/smoke" // smoke test dir
 	SmokeStr                = "smoke"
-	largefilesize           = 4                // in MB
-	PhysMemSizeWarn         = uint64(7 * 1024) // MBs
+	ReplicationDir          = "/tmp/dfc/replicationTest"
+	ReplicationStr          = "replicationTest"
+	largefilesize           = 4 // in MB
 	ProxyURL                = "http://localhost:8080"
+	ProxyURLNext            = "http://localhost:11080" // the url for the next cluster's proxy
 )
 
 var (
@@ -59,14 +60,16 @@ var (
 	clichecksum            string
 	cycles                 int
 
-	clibucket  string
-	proxyURLRO string // user-defined primary proxy URL - it is read-only variable and tests mustn't change it
-	usingSG    bool   // True if using SGL as reader backing memory
-	usingFile  bool   // True if using file as reader backing
+	clibucket          string
+	proxyURLRO         string // user-defined primary proxy URL - it is read-only variable and tests mustn't change it
+	proxyNextTierURLRO string // user-defined primary proxy URL for the second cluster - it is read-only variable and tests mustn't change it
+	usingSG            bool   // True if using SGL as reader backing memory
+	usingFile          bool   // True if using file as reader backing
 )
 
 func init() {
 	flag.StringVar(&proxyURLRO, "url", ProxyURL, "Proxy URL")
+	flag.StringVar(&proxyNextTierURLRO, "urlnext", ProxyURLNext, "Proxy URL Next Tier")
 	flag.IntVar(&numfiles, "numfiles", 100, "Number of the files to download")
 	flag.IntVar(&numworkers, "numworkers", 10, "Number of the workers")
 	flag.StringVar(&match, "match", ".*", "object name regex")
@@ -100,19 +103,12 @@ func init() {
 
 	usingSG = readerType == tutils.ReaderTypeSG
 	usingFile = readerType == tutils.ReaderTypeFile
-	checkMemory()
 
 	if tutils.DockerRunning() && proxyURLRO == ProxyURL {
 		proxyURLRO = "http://172.50.0.2:8080"
 	}
-}
-
-func checkMemory() {
-	if readerType == tutils.ReaderTypeSG || readerType == tutils.ReaderTypeInMem {
-		megabytes, _ := dfc.TotalMemory()
-		if megabytes < PhysMemSizeWarn {
-			fmt.Fprintf(os.Stderr, "Warning: host memory size = %dMB may be insufficient, consider use other reader type\n", megabytes)
-		}
+	if tutils.DockerRunning() && proxyNextTierURLRO == ProxyURLNext {
+		proxyNextTierURLRO = "http://172.53.0.2:8080"
 	}
 }
 
@@ -130,7 +126,12 @@ func TestMain(m *testing.M) {
 		tutils.Logf("Failed to get primary proxy, err = %v", err)
 		os.Exit(1)
 	}
-
 	proxyURLRO = url
+
+	if proxyURLRO == proxyNextTierURLRO {
+		fmt.Println("Proxy Url for first and next tier cluster cannot be the same")
+		os.Exit(1)
+	}
+
 	os.Exit(m.Run())
 }

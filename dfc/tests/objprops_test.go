@@ -5,7 +5,7 @@
 package dfc_test
 
 import (
-	"fmt"
+	"path"
 	"sync"
 	"testing"
 
@@ -21,10 +21,10 @@ func propsStats(t *testing.T, proxyURL string) (objChanged int64, bytesChanged i
 	bytesChanged = 0
 
 	for _, v := range stats.Target {
-		objChanged += v.Core.Tracker["vchange.n"].Value
-		bytesChanged += v.Core.Tracker["vchange.size"].Value
+		// FIXME: stats names => API package, here and elsewhere
+		objChanged += getNamedTargetStats(v, "vchange.n")
+		bytesChanged += getNamedTargetStats(v, "vchange.size")
 	}
-
 	return
 }
 
@@ -37,11 +37,11 @@ func propsUpdateObjects(t *testing.T, proxyURL, bucket string, oldVersions map[s
 		t.Errorf("Failed to create reader: %v", err)
 		t.Fail()
 	}
+	baseParams := tutils.BaseAPIParams(proxyURL)
 	for fname := range oldVersions {
-		err = tutils.Put(proxyURL, r, bucket, fname, !testing.Verbose())
+		err = api.PutObject(baseParams, bucket, fname, r.XXHash(), r)
 		if err != nil {
 			t.Errorf("Failed to put new data to object %s/%s, err: %v", bucket, fname, err)
-			t.Fail()
 		}
 	}
 
@@ -80,14 +80,15 @@ func propsUpdateObjects(t *testing.T, proxyURL, bucket string, oldVersions map[s
 	return
 }
 
-func propsReadObjects(t *testing.T, proxyURL, bucket string, filelist map[string]string) {
+func propsReadObjects(t *testing.T, proxyURL, bucket string, objList map[string]string) {
 	versChanged, bytesChanged := propsStats(t, proxyURL)
 	tutils.Logf("Version mismatch stats before test. Objects: %d, bytes fetched: %d\n", versChanged, bytesChanged)
 
-	for fname := range filelist {
-		_, _, err := tutils.Get(proxyURL, bucket, fname, nil, nil, false, false)
+	baseParams := tutils.BaseAPIParams(proxyURL)
+	for object := range objList {
+		_, err := api.GetObject(baseParams, bucket, object)
 		if err != nil {
-			t.Errorf("Failed to read %s/%s, err: %v", bucket, fname, err)
+			t.Errorf("Failed to read %s/%s, err: %v", bucket, object, err)
 			continue
 		}
 	}
@@ -220,18 +221,10 @@ func propsRebalance(t *testing.T, proxyURL, bucket string, objects map[string]st
 		t.Skipf("Only %d targets found, need at least 2", l)
 	}
 
-	var (
-		removedSid             string
-		removedTargetDirectURL string
-	)
-	for sid, daemon := range smap.Tmap {
-		removedSid = sid
-		removedTargetDirectURL = daemon.PublicNet.DirectURL
-		break
-	}
+	removeTarget := extractTargetNodes(smap)[0]
 
-	tutils.Logf("Removing a target: %s\n", removedSid)
-	err := tutils.UnregisterTarget(proxyURL, removedSid)
+	tutils.Logf("Removing a target: %s\n", removeTarget.DaemonID)
+	err := tutils.UnregisterTarget(proxyURL, removeTarget.DaemonID)
 	tutils.CheckFatal(err, t)
 	smap, err = waitForPrimaryProxy(
 		proxyURL,
@@ -242,13 +235,13 @@ func propsRebalance(t *testing.T, proxyURL, bucket string, objects map[string]st
 	)
 	tutils.CheckFatal(err, t)
 
-	tutils.Logf("Target %s [%s] is removed\n", removedSid, removedTargetDirectURL)
+	tutils.Logf("Target %s [%s] is removed\n", removeTarget.DaemonID, removeTarget.URL(cmn.NetworkPublic))
 
 	// rewrite objects and compare versions - they should change
 	newobjs := propsUpdateObjects(t, proxyURL, bucket, objects, msg, versionEnabled, isLocalBucket)
 
 	tutils.Logf("Reregistering target...\n")
-	err = tutils.RegisterTarget(removedSid, removedTargetDirectURL, smap)
+	err = tutils.RegisterTarget(proxyURL, removeTarget, smap)
 	tutils.CheckFatal(err, t)
 	smap, err = waitForPrimaryProxy(
 		proxyURL,
@@ -340,14 +333,13 @@ func propsTestCore(t *testing.T, versionEnabled bool, isLocalBucket bool) {
 	// Create a few objects
 	tutils.Logf("Creating %d objects...\n", numPuts)
 	ldir := LocalSrcDir + "/" + versionDir
-	putRandObjs(proxyURL, baseseed+110, filesize, int(numPuts), bucket, errCh, filesPutCh,
-		ldir, versionDir, true, sgl)
+	tutils.PutRandObjs(proxyURL, bucket, ldir, readerType, versionDir, filesize, int(numPuts), errCh, filesPutCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filesPutCh)
 	close(errCh)
 	for fname := range filesPutCh {
 		if fname != "" {
-			fileslist[versionDir+"/"+fname] = ""
+			fileslist[path.Join(versionDir, fname)] = ""
 		}
 	}
 
@@ -418,32 +410,32 @@ func propsMainTest(t *testing.T, versioning string) {
 	proxyURL := getPrimaryURL(t, proxyURLRO)
 	chkVersion := true
 
-	config := getConfig(proxyURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
-	versionCfg := config["version_config"].(map[string]interface{})
-	oldChkVersion := versionCfg["validate_version_warm_get"].(bool)
-	oldVersioning := versionCfg["versioning"].(string)
+	config := getDaemonConfig(t, proxyURL)
+	oldChkVersion := config.Ver.ValidateWarmGet
+	oldVersioning := config.Ver.Versioning
+
 	if oldChkVersion != chkVersion {
-		setConfig("validate_version_warm_get", fmt.Sprintf("%v", chkVersion), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setClusterConfig(t, proxyURL, "validate_version_warm_get", chkVersion)
 	}
 	if oldVersioning != versioning {
-		setConfig("versioning", versioning, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setClusterConfig(t, proxyURL, "versioning", versioning)
 	}
 	created := createLocalBucketIfNotExists(t, proxyURL, clibucket)
 
 	defer func() {
 		// restore configuration
 		if oldChkVersion != chkVersion {
-			setConfig("validate_version_warm_get", fmt.Sprintf("%v", oldChkVersion), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+			setClusterConfig(t, proxyURL, "validate_version_warm_get", oldChkVersion)
 		}
 		if oldVersioning != versioning {
-			setConfig("versioning", oldVersioning, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+			setClusterConfig(t, proxyURL, "versioning", oldVersioning)
 		}
 		if created {
 			destroyLocalBucket(t, proxyURL, clibucket)
 		}
 	}()
 
-	props, err := api.HeadBucket(tutils.HTTPClient, proxyURL, clibucket)
+	props, err := api.HeadBucket(tutils.DefaultBaseAPIParams(t), clibucket)
 	if err != nil {
 		t.Fatalf("Could not execute HeadBucket Request: %v", err)
 	}

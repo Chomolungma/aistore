@@ -2,8 +2,6 @@ cat > $CONFFILE <<EOL
 {
 	"confdir":                	"$CONFDIR",
 	"cloudprovider":		"${CLDPROVIDER}",
-	"cloud_buckets":		"cloud",
-	"local_buckets":		"local",
 	"readahead": {
 		"rahobjectmem":		1048576,
 		"rahtotalmem":		1073741824,
@@ -19,6 +17,7 @@ cat > $CONFFILE <<EOL
 	},
 	"periodic": {
 		"stats_time":		"10s",
+		"iostat_time":		"2s",
 		"retry_sync_time":	"2s"
 	},
 	"timeout": {
@@ -45,17 +44,12 @@ cat > $CONFFILE <<EOL
 		"lru_enabled":  	true
 	},
 	"xaction_config":{
-	    "disk_util_low_wm":      60,
+	    "disk_util_low_wm":      20,
 	    "disk_util_high_wm":     80
 	},
 	"rebalance_conf": {
 		"dest_retry_time":	"2m",
 		"rebalancing_enabled": 	true
-	},
-	"replication": {
-		"replicate_on_cold_get": 		false,
-		"replicate_on_put": 			false,
-		"replicate_on_lru_eviction": 	false
 	},
 	"cksum_config": {
 		"checksum":                    "xxhash",
@@ -86,6 +80,7 @@ cat > $CONFFILE <<EOL
 			"port_intra_data":    "${PORT_INTRA_DATA}"
 		},
 		"http": {
+			"proto":		"http",
 			"rproxy":		"",
 			"server_certificate":	"server.crt",
 			"server_key":		"server.key",

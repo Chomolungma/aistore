@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/NVIDIA/dfcpub/api"
 	"github.com/NVIDIA/dfcpub/memsys"
 	"github.com/NVIDIA/dfcpub/tutils"
 )
@@ -33,12 +34,12 @@ func doPut(wo *workOrder) {
 		wo.err = err
 		return
 	}
-
-	wo.err = tutils.Put(wo.proxyURL, r, wo.bucket, wo.objName, true /* silent */)
+	baseParams := tutils.BaseAPIParams(wo.proxyURL)
+	wo.err = api.PutObject(baseParams, wo.bucket, wo.objName, r.XXHash(), r)
 }
 
 func doGet(wo *workOrder) {
-	wo.size, wo.latencies, wo.err = tutils.Get(wo.proxyURL, wo.bucket, wo.objName, nil /* wg */, nil /* errCh */, true, /* silent */
+	wo.size, wo.latencies, wo.err = tutils.GetWithMetrics(wo.proxyURL, wo.bucket, wo.objName, true, /* silent */
 		runParams.verifyHash /* validate */)
 }
 

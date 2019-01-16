@@ -1,10 +1,9 @@
-/*
- * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
- */
 // Package memsys provides memory management and Slab allocation
 // with io.Reader and io.Writer interfaces on top of a scatter-gather lists
 // (of reusable buffers)
+/*
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
+ */
 package memsys
 
 import (
@@ -54,6 +53,13 @@ import (
 // 3) optionally, run:
 // 	go mem2.Run()
 //
+// Cleanup:
+//
+// To clean up a Mem2 instance after it is used, call Stop(error) on the Mem2 instance.
+// Note that a Mem2 instance can be Stopped as long as it had been initialized.
+// This will free all the slabs that were allocated to the memory manager.
+// Since the stop is being performed intentionally, nil should be passed as the error.
+//
 // In addition, there are several environment variables that can be used
 // (to circumvent the need to change the code, for instance):
 // 	"DFC_MINMEM_FREE"
@@ -85,17 +91,31 @@ import (
 
 const Numslabs = 128 / 4 // [4K - 128K] at 4K increments
 const DEADBEEF = "DEADBEEF"
+const GlobalMem2Name = "GMem2"
 
 // mem subsystem defaults (potentially, tunables)
 const (
 	mindepth      = 128             // ring cap min; default ring growth increment
 	maxdepth      = 1024 * 24       // ring cap max
-	sizetoGC      = cmn.GiB * 2  // see heuristics ("Heu")
+	sizetoGC      = cmn.GiB * 2     // see heuristics ("Heu")
 	loadavg       = 10              // "idle" load average to deallocate Slabs when below
-	minMemFree    = cmn.GiB      // default minimum memory size that must remain available - see DFC_MINMEM_*
+	minMemFree    = cmn.GiB         // default minimum memory size that must remain available - see DFC_MINMEM_*
 	memCheckAbove = time.Minute     // default memory checking frequency when above low watermark (see lowwm, setTimer())
 	freeIdleMin   = memCheckAbove   // time to reduce an idle slab to a minimum depth (see mindepth)
 	freeIdleZero  = freeIdleMin * 2 // ... to zero
+)
+
+// slab constants
+const (
+	countThreshold = 32 // exceeding this scatter-gather count warrants selecting a larger-size Slab
+	minSizeUnknown = 32 * cmn.KiB
+)
+
+// mem2 usage levels; one-indexed to avoid zero value check issues
+const (
+	Mem2Initialized = iota + 1
+	Mem2Running
+	Mem2Stopped
 )
 
 //
@@ -139,6 +159,7 @@ type (
 		sorted   []sortpair
 		toGC     int64 // accumulates over time and triggers GC upon reaching the spec-ed limit
 		mindepth int64 // minimum ring depth aka length
+		usageLvl int64 // integer values corresponding to Mem2Initialized, Mem2Running, or Mem2Stopped
 		// for user to specify at construction time
 		Name        string
 		MinFree     uint64        // memory that must be available at all times
@@ -161,11 +182,27 @@ type sortpair struct {
 	v int64
 }
 
+var (
+	// gMem2 is the global memory manager used in various packages outside dfc.
+	// Its runtime params are set below and is intended to remain so.
+	gMem2 = &Mem2{Name: GlobalMem2Name, Period: time.Minute * 2, MinPctFree: 50}
+	// Mapping of usageLvl values to corresponding strings for log messages
+	usageLvls = map[int64]string{Mem2Initialized: "Initialized", Mem2Running: "Running", Mem2Stopped: "Stopped"}
+)
+
+// Global memory manager getter
+func Init() *Mem2 {
+	gMem2.Init(false /* don't ignore init-time errors */)
+	go gMem2.Run()
+	return gMem2
+}
+
 //
 // API methods
 //
 
 func (r *Mem2) NewSGL(immediateSize int64 /* size to allocate at construction time */) *SGL {
+	r.assertReadyForUse()
 	slab := r.SelectSlab2(immediateSize)
 	n := cmn.DivCeil(immediateSize, slab.Size())
 	sgl := make([][]byte, n)
@@ -183,12 +220,37 @@ func (r *Mem2) NewSGLWithHash(immediateSize int64, hash hash.Hash64) *SGL {
 	return sgl
 }
 
+func (r *Mem2) MaxAllocRingLen() (slabBufSize int64, ringLen int) {
+	for _, s := range r.rings {
+		if lget := len(s.get); lget > ringLen { // NOTE: not locking - don't care whether the value is racy
+			ringLen = lget
+			slabBufSize = s.bufsize
+		}
+	}
+	return
+}
+func (r *Mem2) MaxFreeRingLen() (slabBufSize int64, ringLen int) {
+	for _, s := range r.rings {
+		if lput := len(s.put); lput > ringLen {
+			ringLen = lput
+			slabBufSize = s.bufsize
+		}
+	}
+	return
+}
+
 //
 // on error behavior is defined by the ignorerr argument
 // true:  print error message and proceed regardless
 // false: print error message and panic
 //
 func (r *Mem2) Init(ignorerr bool) (err error) {
+	// CAS implemented to enforce only one invocation of gMem2.Init()
+	// for possible concurrent calls to memsys.Init() in multi-threaded context
+	if !atomic.CompareAndSwapInt64(&r.usageLvl, 0, Mem2Initialized) {
+		logMsg(fmt.Sprintf("%s is already %s", r.Name, usageLvls[r.usageLvl]))
+		return
+	}
 	if r.Name != "" {
 		r.Setname(r.Name)
 	}
@@ -271,11 +333,13 @@ func (r *Mem2) Init(ignorerr bool) (err error) {
 
 	// 6. always GC at init time
 	runtime.GC()
+
 	return
 }
 
 // on-demand memory freeing to the user-provided specification
 func (r *Mem2) Free(spec FreeSpec) {
+	r.assertReadyForUse()
 	var freed int64
 	if spec.Totally {
 		for _, s := range r.rings {
@@ -319,32 +383,23 @@ func (r *Mem2) Free(spec FreeSpec) {
 
 // as a cmn.Runner
 func (r *Mem2) Run() error {
+	// if the usageLvl of GMem2 is Mem2Initialized, swaps its usageLvl to Mem2Running atomically
+	// CAS implemented to enforce only one invocation of GMem2.Run()
+	if !atomic.CompareAndSwapInt64(&r.usageLvl, Mem2Initialized, Mem2Running) {
+		return fmt.Errorf("%s needs to be at initialized level, is currently %s", r.Name, usageLvls[r.usageLvl])
+	}
 	r.time.t = time.NewTimer(r.time.d)
 	mem := sigar.Mem{}
 	mem.Get()
 	m, l := cmn.B2S(int64(r.MinFree), 2), cmn.B2S(int64(r.lowwm), 2)
-	str := fmt.Sprintf("Starting %s, minfree %s, low %s, timer %v", r.Getname(), m, l, r.time.d)
-	if flag.Parsed() {
-		glog.Infoln(str)
-	} else {
-		fmt.Println(str)
-	}
+	logMsg(fmt.Sprintf("Starting %s, minfree %s, low %s, timer %v", r.Getname(), m, l, r.time.d))
 	f := cmn.B2S(int64(mem.ActualFree), 2)
 	if mem.ActualFree > mem.Total-mem.Total/5 { // more than 80%
-		str = fmt.Sprintf("%s: free memory %s > 80%% total", r.Getname(), f)
-		if flag.Parsed() {
-			glog.Infoln(str)
-		} else {
-			fmt.Println(str)
-		}
+		logMsg(fmt.Sprintf("%s: free memory %s > 80%% total", r.Getname(), f))
 	} else if mem.ActualFree < r.lowwm {
-		str = fmt.Sprintf("Warning: free memory %s below low watermark %s at %s startup", f, l, r.Getname())
-		if flag.Parsed() {
-			glog.Infoln(str)
-		} else {
-			fmt.Println(str)
-		}
+		logMsg(fmt.Sprintf("Warning: free memory %s below low watermark %s at %s startup", f, l, r.Getname()))
 	}
+
 	for {
 		select {
 		case <-r.time.t.C:
@@ -360,9 +415,7 @@ func (r *Mem2) Run() error {
 			req.Wg.Done()
 		case <-r.stopCh:
 			r.time.t.Stop()
-			for _, s := range r.rings {
-				_ = s.cleanup()
-			}
+			r.stop()
 			return nil
 		}
 	}
@@ -370,8 +423,20 @@ func (r *Mem2) Run() error {
 
 func (r *Mem2) Stop(err error) {
 	glog.Infof("Stopping %s, err: %v", r.Getname(), err)
-	r.stopCh <- struct{}{}
-	close(r.stopCh)
+	if atomic.CompareAndSwapInt64(&r.usageLvl, Mem2Initialized, Mem2Stopped) {
+		r.stop()
+	} else if atomic.CompareAndSwapInt64(&r.usageLvl, Mem2Running, Mem2Stopped) {
+		r.stopCh <- struct{}{}
+		close(r.stopCh)
+	} else {
+		glog.Warningf("%s already stopped", r.Name)
+	}
+}
+
+func (r *Mem2) stop() {
+	for _, s := range r.rings {
+		_ = s.cleanup()
+	}
 }
 
 func (r *Mem2) GetSlab2(bufsize int64) (s *Slab2, err error) {
@@ -389,6 +454,7 @@ func (r *Mem2) GetSlab2(bufsize int64) (s *Slab2, err error) {
 }
 
 func (r *Mem2) SelectSlab2(estimatedSize int64) *Slab2 {
+	r.assertReadyForUse()
 	if estimatedSize == 0 {
 		estimatedSize = minSizeUnknown
 	}
@@ -641,6 +707,13 @@ func (r *Mem2) doStats() {
 	}
 }
 
+func (r *Mem2) assertReadyForUse() {
+	if r.Debug {
+		errstr := fmt.Sprintf("%s is not initialized nor running", r.Name)
+		cmn.Assert(r.usageLvl == Mem2Initialized || r.usageLvl == Mem2Running, errstr)
+	}
+}
+
 func (s *Slab2) _alloc() (buf []byte) {
 	if len(s.get) > s.pos { // fast path
 		buf = s.get[s.pos]
@@ -808,4 +881,12 @@ func (s *Slab2) cleanup() (freed int64) {
 	s.muput.Unlock()
 	s.muget.Unlock()
 	return
+}
+
+func logMsg(arg interface{}) {
+	if flag.Parsed() {
+		glog.Infoln(arg)
+	} else {
+		fmt.Println(arg)
+	}
 }

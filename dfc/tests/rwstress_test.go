@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/dfcpub/api"
 	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/tutils"
 )
@@ -111,7 +112,6 @@ func unlockFile(idx int, fileExists bool) {
 
 	filelock.files[idx].locked = false
 	filelock.files[idx].exists = fileExists
-	return
 }
 
 // generates a list of random file names and a buffer to keep random data for filling up files
@@ -134,8 +134,9 @@ func rwCanRunAsync(currAsyncOps int64, maxAsycOps int) bool {
 
 func rwPutLoop(t *testing.T, proxyURL string, fileNames []string, taskGrp *sync.WaitGroup, doneCh chan int) {
 	var (
-		totalOps int
-		prc      int
+		totalOps   int
+		prc        int
+		baseParams = tutils.BaseAPIParams(proxyURL)
 	)
 	errCh := make(chan error, 10)
 	fileCount := len(fileNames)
@@ -167,12 +168,12 @@ func rwPutLoop(t *testing.T, proxyURL string, fileNames []string, taskGrp *sync.
 					wg.Add(1)
 					localIdx := idx
 					go func() {
-						tutils.PutAsync(&wg, proxyURL, r, clibucket, keyname, errCh, true /* silent */)
+						tutils.PutAsync(&wg, proxyURL, clibucket, keyname, r, errCh)
 						unlockFile(localIdx, rwFileCreated)
 						atomic.AddInt64(&putCounter, -1)
 					}()
 				} else {
-					err = tutils.Put(proxyURL, r, clibucket, keyname, true /* silent */)
+					err = api.PutObject(baseParams, clibucket, keyname, r.XXHash(), r)
 					if err != nil {
 						errCh <- err
 					}
@@ -256,10 +257,13 @@ func rwDelLoop(t *testing.T, proxyURL string, fileNames []string, taskGrp *sync.
 }
 
 func rwGetLoop(t *testing.T, proxyURL string, fileNames []string, taskGrp *sync.WaitGroup, doneCh chan int) {
-	done := false
-	var currIdx, totalOps int
-	errCh := make(chan error, 10)
-	var wg = &sync.WaitGroup{}
+	var (
+		done              = false
+		currIdx, totalOps int
+		errCh             = make(chan error, 10)
+		wg                = &sync.WaitGroup{}
+		baseParams        = tutils.BaseAPIParams(proxyURL)
+	)
 
 	if taskGrp != nil {
 		defer taskGrp.Done()
@@ -274,12 +278,19 @@ func rwGetLoop(t *testing.T, proxyURL string, fileNames []string, taskGrp *sync.
 				wg.Add(1)
 				localIdx := idx
 				go func() {
-					tutils.Get(proxyURL, clibucket, keyname, wg, errCh, true, false)
+					_, err := api.GetObject(baseParams, clibucket, keyname)
+					if err != nil {
+						errCh <- err
+					}
 					unlockFile(localIdx, rwFileExists)
 					atomic.AddInt64(&getCounter, -1)
+					wg.Done()
 				}()
 			} else {
-				tutils.Get(proxyURL, clibucket, keyname, nil, errCh, true, false)
+				_, err := api.GetObject(baseParams, clibucket, keyname)
+				if err != nil {
+					errCh <- err
+				}
 				unlockFile(idx, rwFileExists)
 			}
 			currIdx = idx + 1
@@ -311,7 +322,7 @@ func rwstress(t *testing.T) {
 
 	proxyURL := getPrimaryURL(t, proxyURLRO)
 	created := createLocalBucketIfNotExists(t, proxyURL, clibucket)
-	filelock.files = make([]fileLock, numFiles, numFiles)
+	filelock.files = make([]fileLock, numFiles)
 
 	generateRandomData(t, baseseed+10000, numFiles)
 

@@ -1,0 +1,43 @@
+version: '3'
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - GOBASE=${GOPATH}
+        - TARGETS=${TARGET_CNT:-1000}
+    networks:
+        public:
+    environment:
+      - ROLE=proxy
+      - DFCPRIMARYPROXY=${DFCPRIMARYPROXY}
+    env_file:
+      - /tmp/docker_dfc/aws.env
+    volumes:
+      - ${GOPATH}/src:${GOPATH}/src
+      - ${HOST_CONTAINER_PATH}:/tmp/dfc
+  target:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - GOBASE=${GOPATH}
+        - TARGETS=${TARGET_CNT:-1000}
+    networks:
+        public:
+    environment:
+      - ROLE=target
+    env_file:
+      - /tmp/docker_dfc/aws.env
+    volumes:
+      - ${GOPATH}/src:${GOPATH}/src
+      - ${HOST_CONTAINER_PATH}:/tmp/dfc
+networks:
+  public:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        -
+          subnet: ${PUB_SUBNET}

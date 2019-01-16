@@ -1,8 +1,7 @@
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
@@ -17,9 +16,11 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/atime"
 	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/fs"
+	"github.com/NVIDIA/dfcpub/stats"
 	"github.com/json-iterator/go"
 )
 
@@ -30,28 +31,36 @@ var (
 	runLocalRebalanceOnce = &sync.Once{}
 )
 
-type xrebpathrunner struct {
-	t         *targetrunner
-	mpathplus string
-	xreb      *xactRebalance
-	wg        *sync.WaitGroup
-	newsmap   *smapX
-	aborted   bool
-	fileMoved int64
-	byteMoved int64
-}
+type (
+	globalRebJogger struct {
+		t           *targetrunner
+		mpathplus   string
+		xreb        *xactRebalance
+		wg          *sync.WaitGroup
+		newsmap     *smapX
+		atimeRespCh chan *atime.Response
+		objectMoved int64
+		byteMoved   int64
+		aborted     bool
+	}
+	localRebJogger struct {
+		t           *targetrunner
+		mpath       string
+		xreb        *xactLocalRebalance
+		wg          *sync.WaitGroup
+		objectMoved int64
+		byteMoved   int64
+		aborted     bool
+	}
+)
 
-type localRebPathRunner struct {
-	t         *targetrunner
-	mpath     string
-	xreb      *xactLocalRebalance
-	aborted   bool
-	fileMoved int64
-	byteMoved int64
-}
+//
+// GLOBAL REBALANCE
+//
 
-func (rcl *xrebpathrunner) oneRebalance() {
-	if err := filepath.Walk(rcl.mpathplus, rcl.rebwalkf); err != nil {
+func (rcl *globalRebJogger) jog() {
+	rcl.atimeRespCh = make(chan *atime.Response, 1)
+	if err := filepath.Walk(rcl.mpathplus, rcl.walk); err != nil {
 		s := err.Error()
 		if strings.Contains(s, "xaction") {
 			glog.Infof("Stopping %s traversal due to: %s", rcl.mpathplus, s)
@@ -64,74 +73,62 @@ func (rcl *xrebpathrunner) oneRebalance() {
 }
 
 // the walking callback is executed by the LRU xaction
-func (rcl *xrebpathrunner) rebwalkf(fqn string, osfi os.FileInfo, err error) error {
+func (rcl *globalRebJogger) walk(fqn string, osfi os.FileInfo, err error) error {
 	// Check if we should abort
 	select {
 	case <-rcl.xreb.ChanAbort():
-		err = fmt.Errorf("%s: aborted for path %s", rcl.xreb, rcl.mpathplus)
-		glog.Infoln(err)
-		glog.Flush()
 		rcl.aborted = true
-		return err
+		return fmt.Errorf("%s: aborted, path %s", rcl.xreb, rcl.mpathplus)
 	default:
 		break
 	}
-
-	// Skip files which are not movable (for example workfiles)
-	if spec, _ := cluster.FileSpec(fqn); spec != nil && !spec.PermToMove() {
-		return nil
-	}
 	if err != nil {
-		// If we are traversing non-existing file we should not care
+		// If we are traversing non-existing object we should not care
 		if os.IsNotExist(err) {
-			glog.Warningf("%s does not exist", fqn)
+			glog.Warningf("%s %s", fqn, cmn.DoesNotExist)
 			return nil
 		}
 		// Otherwise we care
 		glog.Errorf("invoked with err: %v", err)
 		return err
 	}
-	// Skip dirs
 	if osfi.Mode().IsDir() {
 		return nil
 	}
-	// rebalance maybe
-	bucket, objname, err := rcl.t.fqn2bckobj(fqn)
-	if err != nil {
-		// It may happen that local rebalance have not yet moved this particular
-		// file and we got and error in fqn2bckobj. Since we might need still
-		// move the file to another target we need to check if mountpath has
-		// changed and prevent from the skipping it.
-		if changed, _, e := rcl.t.changedMountpath(fqn); e != nil || !changed {
-			glog.Warningf("%v - skipping...", err)
-			return nil
+	lom := &cluster.LOM{T: rcl.t, Fqn: fqn}
+	if errstr := lom.Fill(0); errstr != "" {
+		if glog.V(4) {
+			glog.Infof("%s, err %s - skipping...", lom, errstr)
 		}
+		return nil
 	}
-	si, errstr := hrwTarget(bucket, objname, rcl.newsmap)
+	// rebalance, maybe
+	si, errstr := hrwTarget(lom.Bucket, lom.Objname, rcl.newsmap)
 	if errstr != "" {
 		return fmt.Errorf(errstr)
 	}
 	if si.DaemonID == rcl.t.si.DaemonID {
 		return nil
 	}
-
 	// do rebalance
 	if glog.V(4) {
-		glog.Infof("%s/%s %s => %s", bucket, objname, rcl.t.si.DaemonID, si.DaemonID)
+		glog.Infof("%s %s => %s", lom, rcl.t.si, si)
 	}
-	if errstr = rcl.t.sendfile(http.MethodPut, bucket, objname, si, osfi.Size(), "", ""); errstr != "" {
-		glog.Infof("Failed to rebalance %s/%s: %s", bucket, objname, errstr)
+	if errstr = rcl.t.sendfile(http.MethodPut, lom.Bucket, lom.Objname, si, osfi.Size(), "", "", rcl.atimeRespCh); errstr != "" {
+		glog.Infof("Failed to rebalance %s: %s", lom, errstr)
 	} else {
-		// LRU cleans up the file later
-		rcl.fileMoved++
+		// LRU cleans up the object later
+		rcl.objectMoved++
 		rcl.byteMoved += osfi.Size()
 	}
 	return nil
 }
 
+//
 // LOCAL REBALANCE
+//
 
-func (rb *localRebPathRunner) run() {
+func (rb *localRebJogger) jog() {
 	if err := filepath.Walk(rb.mpath, rb.walk); err != nil {
 		s := err.Error()
 		if strings.Contains(s, "xaction") {
@@ -142,72 +139,63 @@ func (rb *localRebPathRunner) run() {
 	}
 
 	rb.xreb.confirmCh <- struct{}{}
+	rb.wg.Done()
 }
 
-func (rb *localRebPathRunner) walk(fqn string, fileInfo os.FileInfo, err error) error {
+func (rb *localRebJogger) walk(fqn string, fileInfo os.FileInfo, err error) error {
 	// Check if we should abort
 	select {
 	case <-rb.xreb.ChanAbort():
-		err = fmt.Errorf("%s aborted, exiting rebwalkf path %s", rb.xreb, rb.mpath)
-		glog.Infoln(err)
-		glog.Flush()
 		rb.aborted = true
-		return err
+		return fmt.Errorf("%s aborted, path %s", rb.xreb, rb.mpath)
 	default:
 		break
 	}
-
-	// Skip files which are not movable (for example workfiles)
-	if spec, _ := cluster.FileSpec(fqn); spec != nil && !spec.PermToMove() {
-		return nil
-	}
 	if err != nil {
-		// If we are traversing non-existing file we should not care
+		// If we are traversing non-existing object we should not care
 		if os.IsNotExist(err) {
-			glog.Warningf("%s does not exist", fqn)
+			glog.Warningf("%s %s", fqn, cmn.DoesNotExist)
 			return nil
 		}
 		// Otherwise we care
 		glog.Errorf("invoked with err: %v", err)
 		return err
 	}
-	// Skip dirs
 	if fileInfo.IsDir() {
 		return nil
 	}
-
-	// Check if we need to move files around
-	changed, newFQN, err := rb.t.changedMountpath(fqn)
-	if err != nil {
-		glog.Warningf("%v - skipping...", err)
+	lom := &cluster.LOM{T: rb.t, Fqn: fqn}
+	if errstr := lom.Fill(0); errstr != "" {
+		if glog.V(4) {
+			glog.Infof("%s, err %v - skipping...", lom, err)
+		}
 		return nil
 	}
-	if !changed {
+	if !lom.Misplaced {
 		return nil
 	}
-
 	if glog.V(4) {
-		glog.Infof("%s => %s", fqn, newFQN)
+		glog.Infof("%s => %s", lom, lom.Newfqn)
 	}
-	dir := filepath.Dir(newFQN)
+	dir := filepath.Dir(lom.Newfqn)
 	if err := cmn.CreateDir(dir); err != nil {
 		glog.Errorf("Failed to create dir: %s", dir)
-		rb.xreb.abort()
-		rb.t.fshc(err, newFQN)
+		rb.xreb.Abort()
+		rb.t.fshc(err, lom.Newfqn)
 		return nil
 	}
 
-	// Copy the file instead of moving, LRU takes care of obsolete copies
+	// Copy the object instead of moving, LRU takes care of obsolete copies
 	if glog.V(4) {
-		glog.Infof("Copying %s -> %s", fqn, newFQN)
+		glog.Infof("Copying %s => %s", fqn, lom.Newfqn)
 	}
-	if errFQN, err := copyFile(fqn, newFQN); err != nil {
+	if errFQN, err := copyFile(fqn, lom.Newfqn); err != nil {
 		glog.Error(err.Error())
 		rb.t.fshc(err, errFQN)
-		rb.xreb.abort()
+		rb.xreb.Abort()
 		return nil
 	}
-	rb.fileMoved++
+	rb.objectMoved++
 	rb.byteMoved += fileInfo.Size()
 
 	return nil
@@ -232,6 +220,7 @@ func (t *targetrunner) pingTarget(si *cluster.Snode, timeout time.Duration, dead
 		timeout: timeout,
 	}
 
+	config := cmn.GCO.Get()
 	for {
 		res := t.call(callArgs)
 		if res.err == nil {
@@ -245,13 +234,13 @@ func (t *targetrunner) pingTarget(si *cluster.Snode, timeout time.Duration, dead
 			glog.Infof("%s is offline, err: %v", si.PublicNet.DirectURL, res.err)
 		}
 		callArgs.timeout = time.Duration(float64(callArgs.timeout)*1.5 + 0.5)
-		if callArgs.timeout > ctx.config.Timeout.MaxKeepalive {
-			callArgs.timeout = ctx.config.Timeout.MaxKeepalive
+		if callArgs.timeout > config.Timeout.MaxKeepalive {
+			callArgs.timeout = config.Timeout.MaxKeepalive
 		}
 		if time.Since(pollstarted) > deadline {
 			break
 		}
-		time.Sleep(ctx.config.Timeout.CplaneOperation * keepaliveRetryFactor * 2)
+		time.Sleep(config.Timeout.CplaneOperation * keepaliveRetryFactor * 2)
 	}
 
 	return ok
@@ -273,11 +262,12 @@ func (t *targetrunner) waitForRebalanceFinish(si *cluster.Snode, rebalanceVersio
 		timeout: defaultTimeout,
 	}
 
+	config := cmn.GCO.Get()
 	for {
 		res := t.call(args)
 		// retry once
 		if res.err == context.DeadlineExceeded {
-			args.timeout = ctx.config.Timeout.CplaneOperation * keepaliveTimeoutFactor * 2
+			args.timeout = config.Timeout.CplaneOperation * keepaliveTimeoutFactor * 2
 			res = t.call(args)
 		}
 
@@ -297,7 +287,7 @@ func (t *targetrunner) waitForRebalanceFinish(si *cluster.Snode, rebalanceVersio
 			break
 		}
 
-		time.Sleep(ctx.config.Timeout.CplaneOperation * keepaliveRetryFactor * 2)
+		time.Sleep(config.Timeout.CplaneOperation * keepaliveRetryFactor * 2)
 	}
 
 	// Phase 2: Wait to ensure any rebalancing on neighbor has kicked in.
@@ -333,7 +323,7 @@ func (t *targetrunner) waitForRebalanceFinish(si *cluster.Snode, rebalanceVersio
 		}
 
 		glog.Infof("waiting for rebalance: %v", si.PublicNet.DirectURL)
-		time.Sleep(ctx.config.Timeout.CplaneOperation * keepaliveRetryFactor * 2)
+		time.Sleep(config.Timeout.CplaneOperation * keepaliveRetryFactor * 2)
 	}
 }
 
@@ -349,6 +339,7 @@ func (t *targetrunner) runRebalance(newsmap *smapX, newtargetid string) {
 	wg.Add(neighborCnt)
 	cancelCh := make(chan string, neighborCnt)
 
+	config := cmn.GCO.Get()
 	for _, si := range newsmap.Tmap {
 		if si.DaemonID == t.si.DaemonID {
 			continue
@@ -357,8 +348,8 @@ func (t *targetrunner) runRebalance(newsmap *smapX, newtargetid string) {
 		go func(si *cluster.Snode) {
 			ok := t.pingTarget(
 				si,
-				ctx.config.Timeout.CplaneOperation*keepaliveTimeoutFactor,
-				ctx.config.Rebalance.DestRetryTime,
+				config.Timeout.CplaneOperation*keepaliveTimeoutFactor,
+				config.Rebalance.DestRetryTime,
 			)
 			if !ok {
 				cancelCh <- si.PublicNet.DirectURL
@@ -377,14 +368,22 @@ func (t *targetrunner) runRebalance(newsmap *smapX, newtargetid string) {
 
 	// find and abort in-progress x-action if exists and if its smap version is lower
 	// start new x-action unless the one for the current version is already in progress
-	availablePaths, _ := fs.Mountpaths.Mountpaths()
-	runnerCnt := len(availablePaths) * 2
+	availablePaths, _ := fs.Mountpaths.Get()
 
-	xreb := t.xactinp.renewRebalance(newsmap.Version, t, runnerCnt)
+	// FIXME: It is a little bit hacky... Duplication is not the best idea..
+	contentRebalancers := 0
+	for _, contentResolver := range fs.CSM.RegisteredContentTypes {
+		if contentResolver.PermToMove() {
+			contentRebalancers++
+		}
+	}
+	runnerCnt := contentRebalancers * len(availablePaths) * 2
+
+	xreb := t.xactions.renewRebalance(newsmap.Version, runnerCnt)
 	if xreb == nil {
 		return
 	}
-	pmarker := t.xactinp.rebalanceInProgress()
+	pmarker := t.xactions.rebalanceInProgress()
 	file, err := cmn.CreateFile(pmarker)
 	if err != nil {
 		glog.Errorln("Failed to create", pmarker, err)
@@ -396,17 +395,26 @@ func (t *targetrunner) runRebalance(newsmap *smapX, newtargetid string) {
 	glog.Infoln(xreb.String())
 	wg = &sync.WaitGroup{}
 
-	allr := make([]*xrebpathrunner, 0, runnerCnt)
-	for _, mpathInfo := range availablePaths {
-		rc := &xrebpathrunner{t: t, mpathplus: fs.Mountpaths.MakePathCloud(mpathInfo.Path), xreb: xreb, wg: wg, newsmap: newsmap}
-		wg.Add(1)
-		go rc.oneRebalance()
-		allr = append(allr, rc)
+	allr := make([]*globalRebJogger, 0, runnerCnt)
+	for contentType, contentResolver := range fs.CSM.RegisteredContentTypes {
+		// Do not start rebalance if given content type has no permission to move.
+		// NOTE: In the future we might have case where we would like to check it
+		// per object/workfile basis rather that directory level.
+		if !contentResolver.PermToMove() {
+			continue
+		}
 
-		rl := &xrebpathrunner{t: t, mpathplus: fs.Mountpaths.MakePathLocal(mpathInfo.Path), xreb: xreb, wg: wg, newsmap: newsmap}
-		wg.Add(1)
-		go rl.oneRebalance()
-		allr = append(allr, rl)
+		for _, mpathInfo := range availablePaths {
+			rc := &globalRebJogger{t: t, mpathplus: fs.Mountpaths.MakePathCloud(mpathInfo.Path, contentType), xreb: xreb, wg: wg, newsmap: newsmap}
+			wg.Add(1)
+			go rc.jog()
+			allr = append(allr, rc)
+
+			rl := &globalRebJogger{t: t, mpathplus: fs.Mountpaths.MakePathLocal(mpathInfo.Path, contentType), xreb: xreb, wg: wg, newsmap: newsmap}
+			wg.Add(1)
+			go rl.jog()
+			allr = append(allr, rl)
+		}
 	}
 	wg.Wait()
 
@@ -417,7 +425,7 @@ func (t *targetrunner) runRebalance(newsmap *smapX, newtargetid string) {
 			if r.aborted {
 				aborted = true
 			}
-			totalMovedN += r.fileMoved
+			totalMovedN += r.objectMoved
 			totalMovedBytes += r.byteMoved
 		}
 		if !aborted {
@@ -426,8 +434,8 @@ func (t *targetrunner) runRebalance(newsmap *smapX, newtargetid string) {
 			}
 		}
 		if totalMovedN > 0 {
-			t.statsif.add(statRebalGlobalCount, totalMovedN)
-			t.statsif.add(statRebalGlobalSize, totalMovedBytes)
+			t.statsif.Add(stats.RebalGlobalCount, totalMovedN)
+			t.statsif.Add(stats.RebalGlobalSize, totalMovedBytes)
 		}
 	}
 	if newtargetid == t.si.DaemonID {
@@ -435,8 +443,6 @@ func (t *targetrunner) runRebalance(newsmap *smapX, newtargetid string) {
 		t.pollRebalancingDone(newsmap) // until the cluster is fully rebalanced - see t.httpobjget
 	}
 	xreb.EndTime(time.Now())
-	glog.Infoln(xreb.String())
-	t.xactinp.del(xreb.ID())
 }
 
 func (t *targetrunner) pollRebalancingDone(newSmap *smapX) {
@@ -458,11 +464,18 @@ func (t *targetrunner) pollRebalancingDone(newSmap *smapX) {
 }
 
 func (t *targetrunner) runLocalRebalance() {
-	availablePaths, _ := fs.Mountpaths.Mountpaths()
-	runnerCnt := len(availablePaths) * 2
-	xreb := t.xactinp.renewLocalRebalance(t, runnerCnt)
+	availablePaths, _ := fs.Mountpaths.Get()
+	// FIXME: It is a little bit hacky... Duplication is not the best idea..
+	contentRebalancers := 0
+	for _, contentResolver := range fs.CSM.RegisteredContentTypes {
+		if contentResolver.PermToMove() {
+			contentRebalancers++
+		}
+	}
+	runnerCnt := contentRebalancers * len(availablePaths) * 2
+	xreb := t.xactions.renewLocalRebalance(runnerCnt)
 
-	pmarker := t.xactinp.localRebalanceInProgress()
+	pmarker := t.xactions.localRebalanceInProgress()
 	file, err := cmn.CreateFile(pmarker)
 	if err != nil {
 		glog.Errorln("Failed to create", pmarker, err)
@@ -470,26 +483,29 @@ func (t *targetrunner) runLocalRebalance() {
 	} else {
 		_ = file.Close()
 	}
-	allr := make([]*localRebPathRunner, 0, runnerCnt)
+	allr := make([]*localRebJogger, 0, runnerCnt)
 
 	wg := &sync.WaitGroup{}
 	glog.Infof("starting local rebalance with %d runners\n", runnerCnt)
-	for _, mpathInfo := range availablePaths {
-		runner := &localRebPathRunner{t: t, mpath: fs.Mountpaths.MakePathCloud(mpathInfo.Path), xreb: xreb}
-		wg.Add(1)
-		go func(runner *localRebPathRunner) {
-			runner.run()
-			wg.Done()
-		}(runner)
-		allr = append(allr, runner)
+	for contentType, contentResolver := range fs.CSM.RegisteredContentTypes {
+		// Do not start rebalance if given content type has no permission to move.
+		// NOTE: In the future we might have case where we would like to check it
+		// per object/workfile basis rather that directory level.
+		if !contentResolver.PermToMove() {
+			continue
+		}
 
-		runner = &localRebPathRunner{t: t, mpath: fs.Mountpaths.MakePathLocal(mpathInfo.Path), xreb: xreb}
-		wg.Add(1)
-		go func(runner *localRebPathRunner) {
-			runner.run()
-			wg.Done()
-		}(runner)
-		allr = append(allr, runner)
+		for _, mpathInfo := range availablePaths {
+			jogger := &localRebJogger{t: t, mpath: fs.Mountpaths.MakePathCloud(mpathInfo.Path, contentType), xreb: xreb, wg: wg}
+			wg.Add(1)
+			go jogger.jog()
+			allr = append(allr, jogger)
+
+			jogger = &localRebJogger{t: t, mpath: fs.Mountpaths.MakePathLocal(mpathInfo.Path, contentType), xreb: xreb, wg: wg}
+			wg.Add(1)
+			go jogger.jog()
+			allr = append(allr, jogger)
+		}
 	}
 	wg.Wait()
 
@@ -500,7 +516,7 @@ func (t *targetrunner) runLocalRebalance() {
 			if r.aborted {
 				aborted = true
 			}
-			totalMovedN += r.fileMoved
+			totalMovedN += r.objectMoved
 			totalMovedBytes += r.byteMoved
 		}
 		if !aborted {
@@ -509,12 +525,10 @@ func (t *targetrunner) runLocalRebalance() {
 			}
 		}
 		if totalMovedN > 0 {
-			t.statsif.add(statRebalLocalCount, totalMovedN)
-			t.statsif.add(statRebalLocalSize, totalMovedBytes)
+			t.statsif.Add(stats.RebalLocalCount, totalMovedN)
+			t.statsif.Add(stats.RebalLocalSize, totalMovedBytes)
 		}
 	}
 
 	xreb.EndTime(time.Now())
-	glog.Infoln(xreb.String())
-	t.xactinp.del(xreb.ID())
 }

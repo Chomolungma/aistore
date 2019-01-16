@@ -1,8 +1,7 @@
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
@@ -13,9 +12,13 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/atime"
 	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/fs"
+	"github.com/NVIDIA/dfcpub/health"
+	"github.com/NVIDIA/dfcpub/ios"
 	"github.com/NVIDIA/dfcpub/memsys"
+	"github.com/NVIDIA/dfcpub/stats"
 	"github.com/json-iterator/go"
 )
 
@@ -34,7 +37,7 @@ const (
 	xmetasyncer      = "metasyncer"
 	xfshc            = "fshc"
 	xreadahead       = "readahead"
-	xreplication     = "replication"
+	xreplication     = "replication" // TODO: fix replication
 )
 
 type (
@@ -49,8 +52,7 @@ type (
 
 	// daemon instance: proxy or storage target
 	daemon struct {
-		config dfconfig
-		rg     *rungroup
+		rg *rungroup
 	}
 
 	rungroup struct {
@@ -78,7 +80,6 @@ type dryRunConfig struct {
 //
 //====================
 var (
-	build      string
 	gmem2      *memsys.Mem2 // gen-purpose system-wide memory manager and slab/SGL allocator (instance, runner)
 	ctx        = &daemon{}
 	clivars    = &cliVars{}
@@ -187,12 +188,12 @@ func dfcinit() {
 		fmt.Fprintf(os.Stderr, "Usage: ... -role=<proxy|target> -config=<json> ...\n")
 		os.Exit(2)
 	}
-	if err := initconfigparam(); err != nil {
+	if err := cmn.LoadConfig(clivars.conffile, clivars.statstime, clivars.proxyurl, clivars.loglevel); err != nil {
 		glog.Fatalf("Failed to initialize, config %q, err: %v", clivars.conffile, err)
 	}
 
 	// init daemon
-	fs.Mountpaths = fs.NewMountedFS(ctx.config.LocalBuckets, ctx.config.CloudBuckets)
+	fs.Mountpaths = fs.NewMountedFS()
 	// NOTE: proxy and, respectively, target terminations are executed in the same
 	//       exact order as the initializations below
 	ctx.rg = &rungroup{
@@ -203,22 +204,28 @@ func dfcinit() {
 		p := &proxyrunner{}
 		p.initSI()
 		ctx.rg.add(p, xproxy)
-		ps := &proxystatsrunner{}
-		ps.init()
+		ps := &stats.Prunner{}
+		ps.Init()
 		ctx.rg.add(ps, xproxystats)
+		_ = p.initStatsD("dfcproxy")
+		ps.Core.StatsdC = &p.statsdC
+
 		ctx.rg.add(newProxyKeepaliveRunner(p), xproxykeepalive)
 		ctx.rg.add(newmetasyncer(p), xmetasyncer)
 	} else {
 		t := &targetrunner{}
 		t.initSI()
 		ctx.rg.add(t, xtarget)
-		ts := &storstatsrunner{}
-		ts.init()
+		ts := &stats.Trunner{TargetRunner: t} // iostat below
+		ts.Init()
 		ctx.rg.add(ts, xstorstats)
+		_ = t.initStatsD("dfctarget")
+		ts.Core.StatsdC = &t.statsdC
+
 		ctx.rg.add(newTargetKeepaliveRunner(t), xtargetkeepalive)
 
 		// iostat is required: ensure that it is installed and its version is right
-		if err := checkIostatVersion(); err != nil {
+		if err := ios.CheckIostatVersion(); err != nil {
 			glog.Exit(err)
 		}
 
@@ -226,22 +233,20 @@ func dfcinit() {
 
 		// system-wide gen-purpose memory manager and slab/SGL allocator
 		mem := &memsys.Mem2{MinPctTotal: 4, MinFree: cmn.GiB * 2} // free mem: try to maintain at least the min of these two
-		_ = mem.Init(false)                                          // don't ignore init-time errors
-		ctx.rg.add(mem, xmem)                                        // to periodically house-keep
-		gmem2 = getmem2()                                            // making it global; getmem2() can still be used
+		_ = mem.Init(false)                                       // don't ignore init-time errors
+		ctx.rg.add(mem, xmem)                                     // to periodically house-keep
+		gmem2 = getmem2()                                         // making it global; getmem2() can still be used
 
-		iostat := newIostatRunner()
-		ctx.rg.add(iostat, xiostat)
-		t.fsprg.add(iostat)
-
-		// for mountpath definition, see fs/mountfs.go
-		if testingFSPpaths() {
-			glog.Infof("Warning: configuring %d fspaths for testing", ctx.config.TestFSP.Count)
+		// fs.Mountpaths must be inited prior to all runners that utilize all
+		// or run per filesystem(s); for mountpath definition, see fs/mountfs.go
+		config := cmn.GCO.Get()
+		if cmn.TestingEnv() {
+			glog.Infof("Warning: configuring %d fspaths for testing", config.TestFSP.Count)
 			fs.Mountpaths.DisableFsIDCheck()
 			t.testCachepathMounts()
 		} else {
-			fsPaths := make([]string, 0, len(ctx.config.FSpaths))
-			for path := range ctx.config.FSpaths {
+			fsPaths := make([]string, 0, len(config.FSpaths))
+			for path := range config.FSpaths {
 				fsPaths = append(fsPaths, path)
 			}
 
@@ -250,26 +255,32 @@ func dfcinit() {
 			}
 		}
 
-		fshc := newFSHC(fs.Mountpaths, &ctx.config.FSHC)
-		ctx.rg.add(fshc, xfshc)
-		t.fsprg.add(fshc)
+		iostat := ios.NewIostatRunner()
+		ctx.rg.add(iostat, xiostat)
+		t.fsprg.Reg(iostat)
+		ts.Riostat = iostat
 
-		if ctx.config.Readahead.Enabled {
+		fshc := health.NewFSHC(fs.Mountpaths, gmem2, fs.CSM)
+		ctx.rg.add(fshc, xfshc)
+		t.fsprg.Reg(fshc)
+
+		if config.Readahead.Enabled {
 			readaheader := newReadaheader()
 			ctx.rg.add(readaheader, xreadahead)
-			t.fsprg.add(readaheader)
+			t.fsprg.Reg(readaheader)
 			t.readahead = readaheader
 		} else {
 			t.readahead = &dummyreadahead{}
 		}
 
-		replRunner := newReplicationRunner(t, fs.Mountpaths)
-		ctx.rg.add(replRunner, xreplication)
-		t.fsprg.add(replRunner)
+		// TODO: not ready yet but will be
+		// replRunner := newReplicationRunner(t, fs.Mountpaths)
+		// ctx.rg.add(replRunner, xreplication, nil)
+		// t.fsprg.Reg(replRunner)
 
-		atime := newAtimeRunner(t, fs.Mountpaths)
+		atime := atime.NewRunner(fs.Mountpaths, iostat)
 		ctx.rg.add(atime, xatime)
-		t.fsprg.add(atime)
+		t.fsprg.Reg(atime)
 	}
 	ctx.rg.add(&sigrunner{}, xsignal)
 }
@@ -287,7 +298,6 @@ func Run() {
 	if ok {
 		goto m
 	}
-	glog.Errorln()
 	glog.Errorf("Terminated with err: %v\n", err)
 	os.Exit(1)
 m:
@@ -300,9 +310,9 @@ m:
 // global helpers
 //
 //==================
-func getproxystatsrunner() *proxystatsrunner {
+func getproxystatsrunner() *stats.Prunner {
 	r := ctx.rg.runmap[xproxystats]
-	rr, ok := r.(*proxystatsrunner)
+	rr, ok := r.(*stats.Prunner)
 	cmn.Assert(ok)
 	return rr
 }
@@ -310,13 +320,6 @@ func getproxystatsrunner() *proxystatsrunner {
 func getproxykeepalive() *proxyKeepaliveRunner {
 	r := ctx.rg.runmap[xproxykeepalive]
 	rr, ok := r.(*proxyKeepaliveRunner)
-	cmn.Assert(ok)
-	return rr
-}
-
-func gettarget() *targetrunner {
-	r := ctx.rg.runmap[xtarget]
-	rr, ok := r.(*targetrunner)
 	cmn.Assert(ok)
 	return rr
 }
@@ -335,6 +338,7 @@ func gettargetkeepalive() *targetKeepaliveRunner {
 	return rr
 }
 
+// TODO: fix replication
 func getreplicationrunner() *replicationRunner {
 	r := ctx.rg.runmap[xreplication]
 	rr, ok := r.(*replicationRunner)
@@ -342,23 +346,23 @@ func getreplicationrunner() *replicationRunner {
 	return rr
 }
 
-func getstorstatsrunner() *storstatsrunner {
+func getstorstatsrunner() *stats.Trunner {
 	r := ctx.rg.runmap[xstorstats]
-	rr, ok := r.(*storstatsrunner)
+	rr, ok := r.(*stats.Trunner)
 	cmn.Assert(ok)
 	return rr
 }
 
-func getiostatrunner() *iostatrunner {
+func getiostatrunner() *ios.IostatRunner {
 	r := ctx.rg.runmap[xiostat]
-	rr, ok := r.(*iostatrunner)
+	rr, ok := r.(*ios.IostatRunner)
 	cmn.Assert(ok)
 	return rr
 }
 
-func getatimerunner() *atimerunner {
+func getatimerunner() *atime.Runner {
 	r := ctx.rg.runmap[xatime]
-	rr, ok := r.(*atimerunner)
+	rr, ok := r.(*atime.Runner)
 	cmn.Assert(ok)
 	return rr
 }
@@ -377,9 +381,9 @@ func getmetasyncer() *metasyncer {
 	return rr
 }
 
-func getfshealthchecker() *fshc {
+func getfshealthchecker() *health.FSHC {
 	r := ctx.rg.runmap[xfshc]
-	rr, ok := r.(*fshc)
+	rr, ok := r.(*health.FSHC)
 	cmn.Assert(ok)
 	return rr
 }

@@ -12,45 +12,63 @@ Users connect to the proxies and execute RESTful commands. Data then moves direc
 
 ## Table of Contents
 
+- [Overview](#overview)
+- [Table of Contents](#table-of-contents)
 - [Prerequisites](#prerequisites)
 - [Getting Started](#getting-started)
-  * [Quick trial start with Docker](#quick-trial-start-with-docker)
-  * [Quick trial start with DFC as an HTTP proxy](#quick-trial-start-with-dfc-as-an-http-proxy)
-  * [Regular installation](#regular-installation)
-  * [A few tips](#a-few-tips)
+    - [Quick trial start with Docker](#quick-trial-start-with-docker)
+    - [Quick trial start with DFC as an HTTP proxy](#quick-trial-start-with-dfc-as-an-http-proxy)
+    - [Regular installation](#regular-installation)
+    - [A few tips](#a-few-tips)
 - [Helpful Links: Go](#helpful-links-go)
 - [Helpful Links: AWS](#helpful-links-aws)
 - [Configuration](#configuration)
-  * [Runtime configuration](#runtime-configuration)
-  * [Managing filesystems](#managing-filesystems)
-  * [Disabling extended attributes](#disabling-extended-attributes)
-  * [Enabling HTTPS](#enabling-https)
-  * [Filesystem Health Checker](#filesystem-health-checker)
-  * [Networking](#networking)
-  * [Reverse proxy](#reverse-proxy)
+    - [Runtime configuration](#runtime-configuration)
+    - [Managing filesystems](#managing-filesystems)
+    - [Disabling extended attributes](#disabling-extended-attributes)
+    - [Enabling HTTPS](#enabling-https)
+    - [Filesystem Health Checker](#filesystem-health-checker)
+    - [Networking](#networking)
+    - [Reverse proxy](#reverse-proxy)
 - [Performance tuning](#performance-tuning)
 - [Performance testing](#performance-testing)
 - [REST Operations](#rest-operations)
-  * [Querying information](#querying-information)
+    - [Querying information](#querying-information)
+    - [Example: querying runtime statistics](#example-querying-runtime-statistics)
 - [Read and Write Data Paths](#read-and-write-data-paths)
+    - [`GET`](#get)
+    - [`PUT`](#put)
 - [List Bucket](#list-bucket)
+        - [properties-and-options](#properties-and-options)
+        - [Example: listing local and Cloud buckets](#example-listing-local-and-cloud-buckets)
+        - [Example: Listing all pages](#example-listing-all-pages)
 - [Cache Rebalancing](#cache-rebalancing)
 - [List/Range Operations](#listrange-operations)
+        - [List](#list)
+        - [Range](#range)
+        - [Examples](#examples)
 - [Joining a Running Cluster](#joining-a-running-cluster)
 - [Highly Available Control Plane](#highly-available-control-plane)
-  * [Bootstrap](#bootstrap)
-  * [Election](#election)
-  * [Non-electable gateways](#non-electable-gateways)
-  * [Metasync](#metasync)
+    - [Bootstrap](#bootstrap)
+    - [Election](#election)
+    - [Non-electable gateways](#non-electable-gateways)
+    - [Metasync](#metasync)
 - [WebDAV](#webdav)
-- [Extended Actions](#extended-actions-xactions)
+- [Extended Actions (xactions)](#extended-actions-xactions)
+    - [Throttling of Xactions](#throttling-of-xactions)
 - [Replication](#replication)
 - [Multi-tiering](#multi-tiering)
-- [Bucket Level Configuration](#bucket-level-configuration)
-  * [Checksumming](#checksumming)
-  * [LRU](#lru)
+- [Bucket-specific Configuration](#bucket-specific-configuration)
+    - [Checksumming](#checksumming)
+    - [LRU](#lru)
+- [Object checksums: brief theory of operations](#object-checksums-brief-theory-of-operations)
 - [Command-line Load Generator](#command-line-load-generator)
 - [Metrics with StatsD](#metrics-with-statsd)
+        - [Proxy metrics:](#proxy-metrics)
+        - [Target Metrics](#target-metrics)
+        - [Disk Metrics](#disk-metrics)
+        - [Keepalive Metrics](#keepalive-metrics)
+        - [dfcloader Metrics](#dfcloader-metrics)
 
 
 ## Prerequisites
@@ -86,7 +104,7 @@ To get started quickly with a containerized, one-proxy, one-target deployment of
 
 ### Quick trial start with DFC as an HTTP proxy
 
-1. Set the field `use_as_proxy` to `true` in  [the configuration](dfc/setup/config.sh) prior to deployment.
+1. Set the field `rproxy` to `cloud` or `target` in  [the configuration](dfc/setup/config.sh) prior to deployment.
 2. Set the environment variable `http_proxy` (supported by most UNIX systems) to the primary proxy URL of your DFC cluster.
 
 ```shell
@@ -247,7 +265,7 @@ Configuration option `fspaths` specifies the list of local directories where sto
 
 NOTE: there must be a 1-to-1 relationship between `fspath` and an underlying local filesystem. Note as well that this may be not the case for the development environments where multiple mountpaths are allowed to coexist within a single filesystem (e.g., tmpfs).
 
-DFC REST API makes it possible to list, add, remove, enable, and disable a `fspath` (and, therefore, the corresponding local filesystem) at runtime. Filesystem's health checker (FSHC) monitors the health of all local filesystems: a filesystem that "accumulates" I/O errors will be disabled and taken out, as far as the DFC built-in mechanism of object distribution. For further details about FSHC and filesystem REST API, please [see FSHC readme](./fshc.md).
+DFC REST API makes it possible to list, add, remove, enable, and disable a `fspath` (and, therefore, the corresponding local filesystem) at runtime. Filesystem's health checker (FSHC) monitors the health of all local filesystems: a filesystem that "accumulates" I/O errors will be disabled and taken out, as far as the DFC built-in mechanism of object distribution. For further details about FSHC and filesystem REST API, please [see FSHC readme](./health/fshc.md).
 
 Warning: as of the version 1.2, all changes done via REST API are not persistent.
 
@@ -265,7 +283,7 @@ Default installation enables filesystem health checker component called FSHC. FS
 
 When enabled, FSHC gets notified on every I/O error upon which it performs extensive checks on the corresponding local filesystem. One possible outcome of this health-checking process is that FSHC disables the faulty filesystems leaving the target with one filesystem less to distribute incoming data.
 
-Please see [FSHC readme](./fshc.md) for further details.
+Please see [FSHC readme](./health/fshc.md) for further details.
 
 ### Networking
 
@@ -279,13 +297,32 @@ DFC gateway can act as a reverse proxy vis-à-vis DFC storage targets. As of the
 
 ## Performance tuning
 
-DFC utilizes local filesystems, which means that under pressure a DFC target will have a significant number of open files. To overcome the system's default `ulimit`, have the following 3 lines in each target's `/etc/security/limits.conf`:
+DFC utilizes local filesystems, which means that under pressure a DFC target will have a significant number of open files. This is often the case when running stress tests that perform highly-intensive, concurrent object PUT operations. In the event that errors stating `too many open files` are encountered, system settings must be changed. To overcome the system's default `ulimit`, have the following 3 lines in each target's `/etc/security/limits.conf`:
 
 ```
 root             hard    nofile          10240
 ubuntu           hard    nofile          1048576
 ubuntu           soft    nofile          1048576
 ```
+After restarting, confirm that the limits have been increased accordingly using 
+```shell
+ulimit -n
+```
+
+If you find that the result is still lower than expected, take the additional steps of modifying
+both `/etc/systemd/system.conf` and `/etc/systemd/user.conf` to change the value of `DefaultLimitNOFILE` to the desired limit. If that line does not exist, append it under the `Manager` section of those two files as such:
+```
+DefaultLimitNOFILE=$desiredLimit
+```
+
+Additionally, add the following line to the end of `/etc/sysctl.conf`:
+```
+fs.file-max=$desiredLimit
+```
+
+After a restart, verify using the same command, `ulimit -n`, that the limit for the number of open files has been increased accordingly.
+
+For more information, refer to this [link](https://ro-che.info/articles/2017-03-26-increase-open-files-limit).
 
 Generally, configuring a DFC cluster to perform under load is a vast topic that would be outside the scope of this README. The usual checklist includes (but is not limited to):
 
@@ -710,19 +747,13 @@ At the time of this writing, only LRU and re-checksumming support throttling.
 
 ## Replication
 
-Object replication in DFC is still in its prototype stage and enables replication by sending objects using HTTP(S) PUT requests from one DFC cluster to another.
-Each worker thread (aka _replicator_) is associated with exactly one configured file system and is tasked with sequential processing of replication requests related to objects
-stored on that file system. Object transfer is on both send and receive sides protected by checksums, ensuring every byte is correctly transferred from
-one cluster to another. Picture below illustrates on a high level how replication service is designed and how object transfer is implemented using HTTP(S) PUT requests.
+Object replication (service) sends and receives objects via HTTP(S). Each replicating worker (aka _replicator_) is associated with a single configured local filesystem and is tasked with queuing and subsequent FIFO processing of *replication requests*. To isolate the, potentially, massive replication traffic from all other intra- and inter-cluster workloads, the service can be configured to utilize a separate network. Replication transfers themselves are end-to-end protected by checksums.
+
+The picture below illustrates some of the aspects of replication service as far as its design and data flows.
 
 <img src="images/replication-overview.png" alt="Replication overview" width="800">
 
-Example of requesting object replication using REST API:
-```shell
-$ curl -i -L -X POST -H 'Content-Type: application/json' -d '{"action": "replicate"}' 'http://localhost:8080/v1/objects/mybucket/myobject'
-```
-
-**Note:** The bucket must be configured with a correct next tier URL and cloud provider `api.ProviderDfc`.
+**Note:** The service is currently in its prototype stage and is not yet available.
 
 ## Multi-tiering
 
@@ -794,6 +825,24 @@ To revert a bucket's entire configuration back to use global parameters, use `"a
 ```shell
 $ curl -i -X PUT -H 'Content-Type: application/json' -d '{"action":"resetprops"}' 'http://localhost:8080/v1/buckets/<bucket-name>'
 ```
+
+## Object checksums: brief theory of operations
+
+1. objects are stored in the cluster with their content checksums and in accordance with their bucket configurations.
+
+2. xxhash is the system-default checksum.
+
+3. user can override the system default on a bucket level, by setting checksum=none.
+
+4. bucket (re)configuration can be done at any time. Bucket's checksumming option can be changed from xxhash to none and back, potentially multiple times and with no limitations.
+
+5. an object with a bad checksum cannot be retrieved (via GET) and cannot be replicated or migrated. Corrupted objects get eventually removed from the system.
+
+6. GET and PUT operations support an option to validate checksums. The validation is done against a checksum stored with an object (GET), or a checksum provided by a user (PUT).
+
+7. object replications and migrations are always checksum-protected. If an object does not have checksum (see #3 above), the latter gets computed on the fly and stored with the object, so that subsequent replications/migrations could reuse it.
+
+8. when two objects in the cluster have identical (bucket, object) names and checksums, they are considered to be full replicas of each other - the fact that allows optimizing PUT,replication, and object migration in a variety of use cases.
 
 ## Command-line Load Generator
 

@@ -1,9 +1,7 @@
+// Package cmn provides common low-level types and utilities for all dfcpub projects
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-
-// Package cmn provides common low-level types and utilities for all dfcpub projects
 package cmn
 
 import (
@@ -13,19 +11,18 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"net"
-	"net/url"
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
+	"sync/atomic"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 	"github.com/OneOfOne/xxhash"
-	"github.com/json-iterator/go"
+	jsoniter "github.com/json-iterator/go"
 )
 
 const (
@@ -50,10 +47,53 @@ var toBiBytes = map[string]int64{
 	"TIB": TiB,
 }
 
+const DoesNotExist = "does not exist"
+
 type (
 	StringSet map[string]struct{}
 	SimpleKVs map[string]string
+	PairF32   struct {
+		Min float32
+		Max float32
+	}
+	PairU32 struct {
+		Min uint32
+		Max uint32
+	}
 )
+
+//
+// PairU32 & PairF32
+//
+func (src *PairU32) CopyTo(dst *PairU32) {
+	atomic.StoreUint32(&dst.Min, atomic.LoadUint32(&src.Min))
+	atomic.StoreUint32(&dst.Max, atomic.LoadUint32(&src.Max))
+}
+
+func (upair *PairU32) Init(f float32) {
+	u := math.Float32bits(f)
+	atomic.StoreUint32(&upair.Max, u)
+	atomic.StoreUint32(&upair.Min, u)
+}
+
+func (upair *PairU32) U2F() (fpair PairF32) {
+	min := atomic.LoadUint32(&upair.Min)
+	fpair.Min = math.Float32frombits(min)
+	max := atomic.LoadUint32(&upair.Max)
+	fpair.Max = math.Float32frombits(max)
+	return
+}
+
+func (fpair PairF32) String() string {
+	if fpair.Min == 0 && fpair.Max == 0 {
+		return "()"
+	}
+	return fmt.Sprintf("(%.2f, %.2f)", fpair.Min, fpair.Max)
+}
+
+//
+// common utils
+//
 
 func S2B(s string) (int64, error) {
 	if s == "" {
@@ -138,22 +178,112 @@ func CopyStruct(dst interface{}, src interface{}) {
 //
 // files, IO, hash
 //
-func CreateDir(dirname string) error {
-	stat, err := os.Stat(dirname)
-	if err == nil && stat.IsDir() {
-		return nil
+
+var (
+	_ ReadOpenCloser = &FileHandle{}
+	_ ReadSizer      = &SizedReader{}
+)
+
+type (
+	ReadOpenCloser interface {
+		io.ReadCloser
+		Open() (io.ReadCloser, error)
 	}
-	err = os.MkdirAll(dirname, 0755)
-	return err
+
+	// ReadSizer is the interface that adds Size method to the basic reader.
+	ReadSizer interface {
+		io.Reader
+		Size() int64
+	}
+
+	FileHandle struct {
+		*os.File
+		fqn string
+	}
+
+	// SizedReader is simple struct which implements ReadSizer interface.
+	SizedReader struct {
+		io.Reader
+		size int64
+	}
+)
+
+func NewFileHandle(fqn string) (*FileHandle, error) {
+	file, err := os.Open(fqn)
+	if err != nil {
+		return nil, err
+	}
+
+	return &FileHandle{file, fqn}, nil
 }
 
-func CreateFile(fname string) (file *os.File, err error) {
-	dirname := filepath.Dir(fname)
-	if err = CreateDir(dirname); err != nil {
-		return
+func (f *FileHandle) Open() (io.ReadCloser, error) {
+	return os.Open(f.fqn)
+}
+
+func NewSizedReader(r io.Reader, size int64) *SizedReader {
+	return &SizedReader{r, size}
+}
+
+func (f *SizedReader) Size() int64 {
+	return f.size
+}
+
+const DefaultBufSize = 32 * KiB
+
+// CreateDir creates directory if does not exists. Does not return error when
+// directory already exists.
+func CreateDir(dir string) error {
+	return os.MkdirAll(dir, 0755)
+}
+
+// CreateFile creates file and ensures that the directories for the file will be
+// created if they do not yet exist.
+func CreateFile(fname string) (*os.File, error) {
+	if err := CreateDir(filepath.Dir(fname)); err != nil {
+		return nil, err
 	}
-	file, err = os.Create(fname)
-	return
+	return os.Create(fname)
+}
+
+// MvFile renames file ensuring that the directory of dst exists. Creates
+// destination directory when it does not exist.
+func MvFile(src, dst string) error {
+	if err := CreateDir(filepath.Dir(dst)); err != nil {
+		return err
+	}
+	return os.Rename(src, dst)
+}
+
+// ReadWriteWithHash reads data from an io.Reader, writes data to an io.Writer and computes
+// xxHash on the data.
+func ReadWriteWithHash(r io.Reader, w io.Writer, buf []byte) (int64, string, error) {
+	var (
+		total int64
+	)
+	if buf == nil {
+		buf = make([]byte, DefaultBufSize)
+	}
+
+	h := xxhash.New64()
+	mw := io.MultiWriter(h, w)
+	for {
+		n, err := r.Read(buf)
+		total += int64(n)
+		if err != nil && err != io.EOF {
+			return 0, "", err
+		}
+
+		if n == 0 {
+			break
+		}
+
+		mw.Write(buf[:n])
+	}
+
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(h.Sum64()))
+	return total, hex.EncodeToString(b), nil
 }
 
 func ReceiveAndChecksum(filewriter io.Writer, rrbody io.Reader,
@@ -169,22 +299,14 @@ func ReceiveAndChecksum(filewriter io.Writer, rrbody io.Reader,
 		hashwriters[len(hashes)] = filewriter
 		writer = io.MultiWriter(hashwriters...)
 	}
-	if buf == nil {
-		written, err = io.Copy(writer, rrbody)
-	} else {
-		written, err = io.CopyBuffer(writer, rrbody, buf)
-	}
+	written, err = io.CopyBuffer(writer, rrbody, buf)
 	return
 }
 
 func ComputeXXHash(reader io.Reader, buf []byte) (csum string, errstr string) {
 	var err error
 	var xx hash.Hash64 = xxhash.New64()
-	if buf == nil {
-		_, err = io.Copy(xx.(io.Writer), reader)
-	} else {
-		_, err = io.CopyBuffer(xx.(io.Writer), reader, buf)
-	}
+	_, err = io.CopyBuffer(xx.(io.Writer), reader, buf)
 	if err != nil {
 		return "", fmt.Sprintf("Failed to copy buffer, err: %v", err)
 	}
@@ -193,20 +315,6 @@ func ComputeXXHash(reader io.Reader, buf []byte) (csum string, errstr string) {
 	binary.BigEndian.PutUint64(hashInBytes, hashIn64)
 	csum = hex.EncodeToString(hashInBytes)
 	return csum, ""
-}
-
-// as of 1.9 net/http does not appear to provide any better way..
-func IsErrConnectionRefused(err error) (yes bool) {
-	if uerr, ok := err.(*url.Error); ok {
-		if noerr, ok := uerr.Err.(*net.OpError); ok {
-			if scerr, ok := noerr.Err.(*os.SyscallError); ok {
-				if scerr.Err == syscall.ECONNREFUSED {
-					yes = true
-				}
-			}
-		}
-	}
-	return
 }
 
 //===========================================================================
@@ -249,4 +357,15 @@ func LocalLoad(pathname string, v interface{}) (err error) {
 	err = jsoniter.NewDecoder(file).Decode(v)
 	_ = file.Close()
 	return
+}
+
+func Ratio(high, low, curr int64) float32 {
+	Assert(high > low && high <= 100 && low < 100 && low > 0)
+	if curr <= low {
+		return 0
+	}
+	if curr >= high {
+		return 1
+	}
+	return float32(curr-low) / float32(high-low)
 }

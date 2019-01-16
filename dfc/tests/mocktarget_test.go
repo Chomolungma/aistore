@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"testing"
 
+	"github.com/NVIDIA/dfcpub/api"
 	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/dfc"
@@ -51,7 +52,8 @@ func runMockTarget(t *testing.T, proxyURL string, mocktgt targetMocker, stopch c
 	}
 
 	<-stopch
-	unregisterMockTarget(proxyURL, mocktgt)
+	err = tutils.UnregisterTarget(proxyURL, mockDaemonID)
+	tutils.CheckFatal(err, t)
 	s.Shutdown(context.Background())
 }
 
@@ -75,17 +77,13 @@ func registerMockTarget(proxyURL string, mocktgt targetMocker, smap *cluster.Sma
 		if err != nil {
 			return err
 		}
-
 		break
 	}
-
-	url := proxyURL + cmn.URLPath(cmn.Version, cmn.Cluster)
-	return tutils.HTTPRequest(http.MethodPost, url, tutils.NewBytesReader(jsonDaemonInfo))
-}
-
-func unregisterMockTarget(proxyURL string, mocktgt targetMocker) error {
-	url := proxyURL + cmn.URLPath(cmn.Version, cmn.Cluster, cmn.Daemon, "MOCK")
-	return tutils.HTTPRequest(http.MethodDelete, url, nil)
+	baseParams := tutils.BaseAPIParams(proxyURL)
+	baseParams.Method = http.MethodPost
+	path := cmn.URLPath(cmn.Version, cmn.Cluster)
+	_, err = api.DoHTTPRequest(baseParams, path, jsonDaemonInfo)
+	return err
 }
 
 type voteRetryMockTarget struct {
@@ -95,7 +93,6 @@ type voteRetryMockTarget struct {
 
 func (*voteRetryMockTarget) filehdlr(w http.ResponseWriter, r *http.Request) {
 	// Ignore all file requests
-	return
 }
 
 func (p *voteRetryMockTarget) daemonhdlr(w http.ResponseWriter, r *http.Request) {

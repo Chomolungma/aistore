@@ -1,8 +1,7 @@
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
@@ -17,6 +16,7 @@ import (
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/NVIDIA/dfcpub/stats"
 	"github.com/json-iterator/go"
 )
 
@@ -37,16 +37,6 @@ type filesWithDeadline struct {
 	bucket   string
 	deadline time.Time
 	done     chan struct{}
-}
-
-type xactPrefetch struct {
-	cmn.XactBase
-	targetrunner *targetrunner
-}
-
-type xactEvictDelete struct {
-	cmn.XactBase
-	targetrunner *targetrunner
 }
 
 type listf func(ct context.Context, objects []string, bucket string, deadline time.Duration, done chan struct{}) error
@@ -108,12 +98,12 @@ func acceptRegexRange(name, prefix string, regex *regexp.Regexp, min, max int64)
 //=============
 
 func (t *targetrunner) doListEvictDelete(ct context.Context, evict bool, objs []string, bucket string, deadline time.Duration, done chan struct{}) error {
-	xdel := t.xactinp.newEvictDelete(evict)
+	xdel := t.xactions.newEvictDelete(evict)
 	defer func() {
 		if done != nil {
 			done <- struct{}{}
 		}
-		t.xactinp.del(xdel.ID())
+		xdel.EndTime(time.Now())
 	}()
 
 	var absdeadline time.Time
@@ -149,92 +139,32 @@ func (t *targetrunner) doListEvict(ct context.Context, objs []string, bucket str
 	return t.doListEvictDelete(ct, true /* evict */, objs, bucket, deadline, done)
 }
 
-// Creates and returns a new extended action after appending it to an array of extended actions in progress
-func (q *xactInProgress) newEvictDelete(evict bool) *xactEvictDelete {
-	q.lock.Lock()
-	defer q.lock.Unlock()
-
-	xact := cmn.ActDelete
-	if evict {
-		xact = cmn.ActEvict
-	}
-
-	id := q.uniqueid()
-	xpre := &xactEvictDelete{XactBase: *cmn.NewXactBase(id, xact)}
-	q.add(xpre)
-	return xpre
-}
-
-func (xact *xactEvictDelete) tostring() string {
-	start := xact.StartTime().Sub(xact.targetrunner.starttime())
-	if !xact.Finished() {
-		return fmt.Sprintf("xaction %s:%d started %v", xact.Kind(), xact.ID(), start)
-	}
-	fin := time.Since(xact.targetrunner.starttime())
-	return fmt.Sprintf("xaction %s:%d started %v finished %v", xact.Kind(), xact.ID(), start, fin)
-}
-
 //=========
 //
 // Prefetch
 //
 //=========
 
-func (t *targetrunner) doPrefetch() {
-	xpre := t.xactinp.renewPrefetch(t)
-	if xpre == nil {
-		return
-	}
-loop:
-	for {
-		select {
-		case fwd := <-t.prefetchQueue:
-			if !fwd.deadline.IsZero() && time.Now().After(fwd.deadline) {
-				continue
-			}
-			bucket := fwd.bucket
-			for _, objname := range fwd.objnames {
-				t.prefetchMissing(fwd.ctx, objname, bucket)
-			}
-
-			// Signal completion of prefetch
-			if fwd.done != nil {
-				fwd.done <- struct{}{}
-			}
-		default:
-			// When there is nothing left to fetch, the prefetch routine ends
-			break loop
-
-		}
-	}
-
-	xpre.EndTime(time.Now())
-	t.xactinp.del(xpre.ID())
-}
-
 func (t *targetrunner) prefetchMissing(ct context.Context, objname, bucket string) {
 	var (
-		errstr, version   string
+		errstr            string
 		vchanged, coldget bool
-		props             *objectProps
+		lom               = &cluster.LOM{T: t, Bucket: bucket, Objname: objname}
+		versioncfg        = &cmn.GCO.Get().Ver
 	)
-	versioncfg := &ctx.config.Ver
-	islocal := t.bmdowner.get().islocal(bucket)
-	fqn, errstr := cluster.FQN(bucket, objname, islocal)
-	if errstr != "" {
+	if errstr = lom.Fill(cluster.LomFstat | cluster.LomVersion | cluster.LomCksum); errstr != "" {
 		glog.Error(errstr)
 		return
 	}
-	//
-	// NOTE: lockless
-	//
-	coldget, _, version, errstr = t.lookupLocally(bucket, objname, fqn)
-	if (errstr != "" && !coldget) || (errstr != "" && coldget && islocal) {
-		glog.Errorln(errstr)
+	if lom.Bislocal { // must not come here
+		if lom.Doesnotexist {
+			glog.Errorf("prefetch: %s", lom)
+		}
 		return
 	}
-	if !coldget && !islocal && versioncfg.ValidateWarmGet && version != "" && t.versioningConfigured(bucket) {
-		if vchanged, errstr, _ = t.checkCloudVersion(ct, bucket, objname, version); errstr != "" {
+	coldget = lom.Doesnotexist
+	if lom.Exists() && versioncfg.ValidateWarmGet && lom.Version != "" && versioningConfigured(false) {
+		if vchanged, errstr, _ = t.checkCloudVersion(ct, bucket, objname, lom.Version); errstr != "" {
 			return
 		}
 		coldget = vchanged
@@ -242,26 +172,26 @@ func (t *targetrunner) prefetchMissing(ct context.Context, objname, bucket strin
 	if !coldget {
 		return
 	}
-	if props, errstr, _ = t.coldget(ct, bucket, objname, true); errstr != "" {
+	if errstr, _ = t.getCold(ct, lom, true); errstr != "" {
 		if errstr != "skip" {
 			glog.Errorln(errstr)
 		}
 		return
 	}
 	if glog.V(4) {
-		glog.Infof("PREFETCH: %s/%s", bucket, objname)
+		glog.Infof("prefetch: %s", lom)
 	}
-	t.statsif.add(statPrefetchCount, 1)
-	t.statsif.add(statPrefetchSize, props.size)
+	t.statsif.Add(stats.PrefetchCount, 1)
+	t.statsif.Add(stats.PrefetchSize, lom.Size)
 	if vchanged {
-		t.statsif.add(statVerChangeSize, props.size)
-		t.statsif.add(statVerChangeCount, 1)
+		t.statsif.Add(stats.VerChangeSize, lom.Size)
+		t.statsif.Add(stats.VerChangeCount, 1)
 	}
 }
 
 func (t *targetrunner) addPrefetchList(ct context.Context, objs []string, bucket string,
 	deadline time.Duration, done chan struct{}) error {
-	if t.bmdowner.get().islocal(bucket) {
+	if t.bmdowner.get().IsLocal(bucket) {
 		return fmt.Errorf("Cannot prefetch from a local bucket: %s", bucket)
 	}
 	var absdeadline time.Time
@@ -271,31 +201,6 @@ func (t *targetrunner) addPrefetchList(ct context.Context, objs []string, bucket
 	}
 	t.prefetchQueue <- filesWithDeadline{ctx: ct, objnames: objs, bucket: bucket, deadline: absdeadline, done: done}
 	return nil
-}
-
-func (q *xactInProgress) renewPrefetch(t *targetrunner) *xactPrefetch {
-	q.lock.Lock()
-	defer q.lock.Unlock()
-	_, xx := q.findU(cmn.ActPrefetch)
-	if xx != nil {
-		xpre := xx.(*xactPrefetch)
-		glog.Infof("%s already running, nothing to do", xpre.tostring())
-		return nil
-	}
-	id := q.uniqueid()
-	xpre := &xactPrefetch{XactBase: *cmn.NewXactBase(id, cmn.ActPrefetch)}
-	xpre.targetrunner = t
-	q.add(xpre)
-	return xpre
-}
-
-func (xact *xactPrefetch) tostring() string {
-	start := xact.StartTime().Sub(xact.targetrunner.starttime())
-	if !xact.Finished() {
-		return fmt.Sprintf("xaction %s:%d started %v", xact.Kind(), xact.ID(), start)
-	}
-	fin := time.Since(xact.targetrunner.starttime())
-	return fmt.Sprintf("xaction %s:%d started %v finished %v", xact.Kind(), xact.ID(), start, fin)
 }
 
 //================
@@ -479,7 +384,7 @@ func (t *targetrunner) listOperation(r *http.Request, apitems []string, listMsg 
 			err := f(t.contextWithAuth(r), objs, bucket, listMsg.Deadline, done)
 			if err != nil {
 				glog.Errorf("Error performing list function: %v", err)
-				t.statsif.add(statErrListCount, 1)
+				t.statsif.Add(stats.ErrListCount, 1)
 			}
 			errCh <- err
 		}()
@@ -500,7 +405,7 @@ func (t *targetrunner) iterateBucketListPages(r *http.Request, apitems []string,
 		prefix         = rangeMsg.Prefix
 		ct             = t.contextWithAuth(r)
 		msg            = &cmn.GetMsg{GetPrefix: prefix, GetProps: cmn.GetPropsStatus}
-		islocal        = t.bmdowner.get().islocal(bucket)
+		islocal        = t.bmdowner.get().IsLocal(bucket)
 	)
 
 	min, max, err := parseRange(rangeMsg.Range)

@@ -1,6 +1,7 @@
+// Package transport provides streaming object-based transport over http for intra-cluster continuous
+// intra-cluster communications (see README for details and usage example).
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
 package transport_test
 
@@ -30,6 +31,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"strconv"
 	"sync"
 	"testing"
@@ -69,10 +71,7 @@ func init() {
 		fmt.Printf("Invalid duration '%s'\n", d)
 		os.Exit(1)
 	}
-
-	Mem2 = &memsys.Mem2{Period: time.Minute * 2, Name: "TransportMem2"}
-	Mem2.Init(false)
-	go Mem2.Run()
+	Mem2 = memsys.Init()
 }
 
 func Example_Headers() {
@@ -123,7 +122,8 @@ func sendText(stream *transport.Stream, txt1, txt2 string) {
 }
 
 func Example_Mux() {
-	receive := func(w http.ResponseWriter, hdr transport.Header, objReader io.Reader) {
+	receive := func(w http.ResponseWriter, hdr transport.Header, objReader io.Reader, err error) {
+		cmn.Assert(err == nil)
 		object, err := ioutil.ReadAll(objReader)
 		if err != nil && err != io.EOF {
 			panic(err)
@@ -184,13 +184,16 @@ func Test_OneStream(t *testing.T) {
 
 func Test_CancelStream(t *testing.T) {
 	mux := http.NewServeMux()
-
-	transport.SetMux("nc", mux)
+	network := "nc"
+	transport.SetMux(network, mux)
 
 	ts := httptest.NewServer(mux)
 	defer ts.Close()
 
-	recvFunc := func(w http.ResponseWriter, hdr transport.Header, objReader io.Reader) {
+	recvFunc := func(w http.ResponseWriter, hdr transport.Header, objReader io.Reader, err error) {
+		if err != nil {
+			return // stream probably canceled nothing to do
+		}
 		slab := Mem2.SelectSlab2(cmn.GiB)
 		buf := slab.Alloc()
 		written, err := io.CopyBuffer(ioutil.Discard, objReader, buf)
@@ -201,8 +204,8 @@ func Test_CancelStream(t *testing.T) {
 		}
 		slab.Free(buf)
 	}
-
-	path, err := transport.Register("nc", "cancel-rx-88", recvFunc)
+	trname := "cancel-rx-88"
+	path, err := transport.Register(network, trname, recvFunc)
 	tutils.CheckFatal(err, t)
 
 	httpclient := &http.Client{Transport: &http.Transport{}}
@@ -221,7 +224,7 @@ func Test_CancelStream(t *testing.T) {
 		num++
 		size += hdr.Dsize
 		if size-prevsize >= cmn.GiB {
-			tutils.Logf("[%2d]: %d GiB\n", 88, size/cmn.GiB)
+			tutils.Logf("%s: %d GiB\n", stream, size/cmn.GiB)
 			prevsize = size
 			if num > 10 && random.Int63()%3 == 0 {
 				cancel()
@@ -230,7 +233,12 @@ func Test_CancelStream(t *testing.T) {
 			}
 		}
 	}
-	stream.Fin() // no-op: can be skipped as well
+	time.Sleep(time.Second)
+	termReason, termErr := stream.TermInfo()
+	stats := stream.GetStats()
+	fmt.Printf("send$ %s: offset=%d, num=%d(%d), idle=%.2f%%, term(%s, %v)\n",
+		stream, stats.Offset, stats.Num, num, stats.IdlePct, termReason, termErr)
+	stream.Fin() // vs. stream being term-ed
 }
 
 func Test_MultiStream(t *testing.T) {
@@ -411,8 +419,9 @@ func streamWriteUntil(t *testing.T, ii int, wg *sync.WaitGroup, ts *httptest.Ser
 	stream.Fin()
 	stats := stream.GetStats()
 	if netstats == nil {
-		fmt.Printf("send$ %s[%d]: offset=%d, num=%d(%d), idle=%.2f%%\n",
-			trname, sessid, stats.Offset, stats.Num, num, stats.IdlePct)
+		termReason, termErr := stream.TermInfo()
+		fmt.Printf("send$ %s[%d]: offset=%d, num=%d(%d), idle=%.2f%%, term(%s, %v)\n",
+			trname, sessid, stats.Offset, stats.Num, num, stats.IdlePct, termReason, termErr)
 	} else {
 		lock.Lock()
 		eps := make(transport.EndpointStats)
@@ -428,7 +437,8 @@ func streamWriteUntil(t *testing.T, ii int, wg *sync.WaitGroup, ts *httptest.Ser
 
 func makeRecvFunc(t *testing.T) (*int64, transport.Receive) {
 	totalReceived := new(int64)
-	return totalReceived, func(w http.ResponseWriter, hdr transport.Header, objReader io.Reader) {
+	return totalReceived, func(w http.ResponseWriter, hdr transport.Header, objReader io.Reader, err error) {
+		cmn.Assert(err == nil)
 		slab := Mem2.SelectSlab2(32 * cmn.KiB)
 		buf := slab.Alloc()
 		written, err := io.CopyBuffer(ioutil.Discard, objReader, buf)
@@ -460,7 +470,7 @@ func genStaticHeader() (hdr transport.Header) {
 func genRandomHeader(random *rand.Rand) (hdr transport.Header) {
 	x := random.Int63()
 	hdr.Bucket = strconv.FormatInt(x, 10)
-	hdr.Objname = hdr.Bucket + "/" + strconv.FormatInt(cmn.MaxInt64-x, 10)
+	hdr.Objname = path.Join(hdr.Bucket, strconv.FormatInt(cmn.MaxInt64-x, 10))
 	pos := x % int64(len(text))
 	hdr.Opaque = []byte(text[int(pos):])
 	y := x & 3
@@ -484,10 +494,11 @@ func genRandomHeader(random *rand.Rand) (hdr transport.Header) {
 //===========================================================================
 
 type randReader struct {
-	buf  []byte
-	hdr  transport.Header
-	slab *memsys.Slab2
-	off  int64
+	buf    []byte
+	hdr    transport.Header
+	slab   *memsys.Slab2
+	off    int64
+	random *rand.Rand
 }
 
 func newRandReader(random *rand.Rand, hdr transport.Header, slab *memsys.Slab2) *randReader {
@@ -496,7 +507,7 @@ func newRandReader(random *rand.Rand, hdr transport.Header, slab *memsys.Slab2) 
 	if err != nil {
 		panic("Failed read rand: " + err.Error())
 	}
-	return &randReader{buf: buf, hdr: hdr, slab: slab}
+	return &randReader{buf: buf, hdr: hdr, slab: slab, random: random}
 }
 
 func makeRandReader() (transport.Header, *randReader) {
@@ -521,6 +532,13 @@ func (r *randReader) Read(p []byte) (n int, err error) {
 		n += nr
 		r.off += int64(nr)
 	}
+}
+
+func (r *randReader) Open() (io.ReadCloser, error) {
+	buf := r.slab.Alloc()
+	copy(buf, r.buf)
+	r2 := randReader{buf: buf, hdr: r.hdr, slab: r.slab}
+	return &r2, nil
 }
 
 func (r *randReader) Close() error {

@@ -1,8 +1,7 @@
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
@@ -29,21 +28,24 @@ import (
 	"time"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/atime"
 	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
-	"github.com/NVIDIA/dfcpub/dfc/statsd"
 	"github.com/NVIDIA/dfcpub/dfc/util/readers"
+	"github.com/NVIDIA/dfcpub/dsort"
 	"github.com/NVIDIA/dfcpub/fs"
+	"github.com/NVIDIA/dfcpub/lru"
 	"github.com/NVIDIA/dfcpub/memsys"
+	"github.com/NVIDIA/dfcpub/stats"
+	"github.com/NVIDIA/dfcpub/stats/statsd"
 	"github.com/NVIDIA/dfcpub/transport"
 	"github.com/OneOfOne/xxhash"
-	"github.com/json-iterator/go"
+	jsoniter "github.com/json-iterator/go"
 )
 
 const (
 	internalPageSize = 10000     // number of objects in a page for internal call between target and proxy to get atime/iscached
 	MaxPageSize      = 64 * 1024 // max number of objects in a page (warning logged if requested page size exceeds this limit)
-	doesnotexist     = "does not exist"
 	maxBytesInMem    = 256 * cmn.KiB
 )
 
@@ -65,58 +67,50 @@ type (
 		needChkSum   bool
 		needVersion  bool
 		needStatus   bool
-		atimeRespCh  chan *atimeResponse
+		atimeRespCh  chan *atime.Response
 	}
-
 	uxprocess struct {
 		starttime time.Time
 		spid      string
 		pid       int64
 	}
-
 	thealthstatus struct {
 		IsRebalancing bool `json:"is_rebalancing"`
 		// NOTE: include core stats and other info as needed
 	}
-
 	renamectx struct {
 		bucketFrom string
 		bucketTo   string
 		t          *targetrunner
 	}
-
 	regstate struct {
 		sync.Mutex
 		disabled bool // target was unregistered by internal event (e.g, all mountpaths are down)
 	}
-
-	fspathDispatcher interface {
-		DisableMountpath(path string, why string) (disabled, exists bool)
+	targetrunner struct {
+		httprunner
+		cloudif        cloudif // multi-cloud backend
+		uxprocess      *uxprocess
+		rtnamemap      *rtnamemap
+		prefetchQueue  chan filesWithDeadline
+		authn          *authManager
+		clusterStarted int64
+		regstate       regstate // registration state - the state of being registered (with the proxy) or maybe not
+		fsprg          fsprungroup
+		readahead      readaheader
 	}
 )
 
-//===========================================================================
 //
 // target runner
 //
-//===========================================================================
-type targetrunner struct {
-	httprunner
-	cloudif        cloudif // multi-cloud backend
-	uxprocess      *uxprocess
-	rtnamemap      *rtnamemap
-	prefetchQueue  chan filesWithDeadline
-	authn          *authManager
-	clusterStarted int64
-	regstate       regstate // registration state - the state of being registered (with the proxy) or maybe not
-	fsprg          fsprungroup
-	readahead      readaheader
-}
 
-// start target runner
 func (t *targetrunner) Run() error {
+	config := cmn.GCO.Get()
+
 	var ereg error
 	t.httprunner.init(getstorstatsrunner(), false)
+	t.registerStats()
 	t.httprunner.keepalive = gettargetkeepalive()
 
 	dryinit()
@@ -133,7 +127,7 @@ func (t *targetrunner) Run() error {
 		var status int
 		if status, ereg = t.register(false, defaultTimeout); ereg != nil {
 			if cmn.IsErrConnectionRefused(ereg) || status == http.StatusRequestTimeout {
-				glog.Errorf("Target %s: retrying registration...", t.si.DaemonID)
+				glog.Errorf("Target %s: retrying registration...", t.si)
 				time.Sleep(time.Second)
 				continue
 			}
@@ -141,32 +135,40 @@ func (t *targetrunner) Run() error {
 		break
 	}
 	if ereg != nil {
-		glog.Errorf("Target %s failed to register, err: %v", t.si.DaemonID, ereg)
-		glog.Errorf("Target %s is terminating", t.si.DaemonID)
+		glog.Errorf("Target %s failed to register, err: %v", t.si, ereg)
+		glog.Errorf("Target %s is terminating", t.si)
 		return ereg
 	}
 
 	go t.pollClusterStarted()
 
-	err := t.createBucketDirs("local", ctx.config.LocalBuckets, fs.Mountpaths.MakePathLocal)
-	if err != nil {
+	// register object type and workfile type
+	if err := fs.CSM.RegisterFileType(fs.ObjectType, &fs.ObjectContentResolver{}); err != nil {
 		glog.Error(err)
 		os.Exit(1)
 	}
-	err = t.createBucketDirs("cloud", ctx.config.CloudBuckets, fs.Mountpaths.MakePathCloud)
-	if err != nil {
+	if err := fs.CSM.RegisterFileType(fs.WorkfileType, &fs.WorkfileContentResolver{}); err != nil {
+		glog.Error(err)
+		os.Exit(1)
+	}
+
+	if err := fs.Mountpaths.CreateBucketDir(fs.BucketLocalType); err != nil {
+		glog.Error(err)
+		os.Exit(1)
+	}
+	if err := fs.Mountpaths.CreateBucketDir(fs.BucketCloudType); err != nil {
 		glog.Error(err)
 		os.Exit(1)
 	}
 	t.detectMpathChanges()
 
 	// cloud provider
-	if ctx.config.CloudProvider == cmn.ProviderAmazon {
+	if config.CloudProvider == cmn.ProviderAmazon {
 		// TODO: sessions
 		t.cloudif = &awsimpl{t}
 
 	} else {
-		cmn.Assert(ctx.config.CloudProvider == cmn.ProviderGoogle)
+		cmn.Assert(config.CloudProvider == cmn.ProviderGoogle)
 		t.cloudif = &gcpimpl{t}
 	}
 
@@ -196,30 +198,27 @@ func (t *targetrunner) Run() error {
 	t.registerIntraControlNetHandler(cmn.URLPath(cmn.Version, cmn.Metasync), t.metasyncHandler)
 	t.registerIntraControlNetHandler(cmn.URLPath(cmn.Version, cmn.Health), t.healthHandler)
 	t.registerIntraControlNetHandler(cmn.URLPath(cmn.Version, cmn.Vote), t.voteHandler)
-	if ctx.config.Net.UseIntraControl {
+	t.registerIntraControlNetHandler(cmn.URLPath(cmn.Version, cmn.Sort), dsort.SortHandler)
+	if config.Net.UseIntraControl {
 		transport.SetMux(cmn.NetworkIntraControl, t.intraControlServer.mux) // to register transport handlers at runtime
 		t.registerIntraControlNetHandler("/", cmn.InvalidHandler)
 	}
 
 	// Intra data network
-	if ctx.config.Net.UseIntraData {
+	if config.Net.UseIntraData {
 		transport.SetMux(cmn.NetworkIntraData, t.intraDataServer.mux) // to register transport handlers at runtime
 		t.registerIntraDataNetHandler(cmn.URLPath(cmn.Version, cmn.Objects)+"/", t.objectHandler)
 		t.registerIntraDataNetHandler("/", cmn.InvalidHandler)
 	}
 
-	glog.Infof("Target %s is ready", t.si.DaemonID)
+	glog.Infof("target %s is ready", t.si)
 	glog.Flush()
 	pid := int64(os.Getpid())
 	t.uxprocess = &uxprocess{time.Now(), strconv.FormatInt(pid, 16), pid}
 
-	_ = t.initStatsD("dfctarget")
-	sr := getstorstatsrunner()
-	sr.Core.statsdC = &t.statsdC
-
 	getfshealthchecker().SetDispatcher(t)
 
-	aborted, _ := t.xactinp.isAbortedOrRunningLocalRebalance()
+	aborted, _ := t.xactions.isAbortedOrRunningLocalRebalance()
 	if aborted {
 		// resume local rebalance
 		f := func() {
@@ -232,10 +231,37 @@ func (t *targetrunner) Run() error {
 	return t.httprunner.run()
 }
 
+// target-only stats
+func (t *targetrunner) registerStats() {
+	t.statsif.Register(stats.PutLatency, stats.KindLatency)
+	t.statsif.Register(stats.GetColdCount, stats.KindCounter)
+	t.statsif.Register(stats.GetColdSize, stats.KindCounter)
+	t.statsif.Register(stats.LruEvictSize, stats.KindCounter)
+	t.statsif.Register(stats.LruEvictCount, stats.KindCounter)
+	t.statsif.Register(stats.TxCount, stats.KindCounter)
+	t.statsif.Register(stats.TxSize, stats.KindCounter)
+	t.statsif.Register(stats.RxCount, stats.KindCounter)
+	t.statsif.Register(stats.RxSize, stats.KindCounter)
+	t.statsif.Register(stats.PrefetchCount, stats.KindCounter)
+	t.statsif.Register(stats.PrefetchSize, stats.KindCounter)
+	t.statsif.Register(stats.VerChangeCount, stats.KindCounter)
+	t.statsif.Register(stats.VerChangeSize, stats.KindCounter)
+	t.statsif.Register(stats.ErrCksumCount, stats.KindCounter)
+	t.statsif.Register(stats.ErrCksumSize, stats.KindCounter)
+	t.statsif.Register(stats.GetRedirLatency, stats.KindLatency)
+	t.statsif.Register(stats.PutRedirLatency, stats.KindLatency)
+	t.statsif.Register(stats.RebalGlobalCount, stats.KindCounter)
+	t.statsif.Register(stats.RebalLocalCount, stats.KindCounter)
+	t.statsif.Register(stats.RebalGlobalSize, stats.KindCounter)
+	t.statsif.Register(stats.RebalLocalSize, stats.KindCounter)
+	t.statsif.Register(stats.ReplPutCount, stats.KindCounter)
+	t.statsif.Register(stats.ReplPutLatency, stats.KindLatency)
+}
+
 // stop gracefully
 func (t *targetrunner) Stop(err error) {
 	glog.Infof("Stopping %s, err: %v", t.Getname(), err)
-	sleep := t.xactinp.abortAll()
+	sleep := t.xactions.abortAll()
 	if t.publicServer.s != nil {
 		t.unregister() // ignore errors
 	}
@@ -295,10 +321,81 @@ func (t *targetrunner) unregister() (int, error) {
 	return res.status, res.err
 }
 
-func (t *targetrunner) bucketLRUEnabled(bucket string) bool {
-	bucketmd := t.bmdowner.get()
-	return bucketmd.lruEnabled(bucket)
+//===========================================================================================
+//
+// targetrunner's API for external packages
+//
+//===========================================================================================
+
+// implements cluster.Target interfaces
+var _ cluster.Target = &targetrunner{}
+
+func (t *targetrunner) IsRebalancing() bool {
+	_, running := t.xactions.isAbortedOrRunningRebalance()
+	_, runningLocal := t.xactions.isAbortedOrRunningLocalRebalance()
+	return running || runningLocal
 }
+
+// gets triggered by the stats evaluation of a remaining capacity
+// and then runs in a goroutine - see stats package, target_stats.go
+func (t *targetrunner) RunLRU() {
+	xlru := t.xactions.renewLRU()
+	if xlru == nil {
+		return
+	}
+	ini := lru.InitLRU{
+		Xlru:        xlru,
+		Namelocker:  t.rtnamemap,
+		Statsif:     t.statsif,
+		T:           t,
+		CtxResolver: fs.CSM,
+	}
+	lru.InitAndRun(&ini) // blocking
+
+	xlru.EndTime(time.Now())
+}
+
+func (t *targetrunner) PrefetchQueueLen() int { return len(t.prefetchQueue) }
+
+func (t *targetrunner) Prefetch() {
+	xpre := t.xactions.renewPrefetch()
+	if xpre == nil {
+		return
+	}
+loop:
+	for {
+		select {
+		case fwd := <-t.prefetchQueue:
+			if !fwd.deadline.IsZero() && time.Now().After(fwd.deadline) {
+				continue
+			}
+			bucket := fwd.bucket
+			bucketmd := t.bmdowner.get()
+			if islocal := bucketmd.IsLocal(bucket); islocal {
+				glog.Errorf("prefetch: bucket  %s is local, nothing to do", bucket)
+			} else {
+				for _, objname := range fwd.objnames {
+					t.prefetchMissing(fwd.ctx, objname, bucket)
+				}
+			}
+			// Signal completion of prefetch
+			if fwd.done != nil {
+				fwd.done <- struct{}{}
+			}
+		default:
+			// When there is nothing left to fetch, the prefetch routine ends
+			break loop
+
+		}
+	}
+	xpre.EndTime(time.Now())
+}
+
+func (t *targetrunner) GetBowner() cluster.Bowner     { return t.bmdowner }
+func (t *targetrunner) FSHC(err error, path string)   { t.fshc(err, path) }
+func (t *targetrunner) GetAtimeRunner() *atime.Runner { return getatimerunner() }
+func (t *targetrunner) GetMem2() *memsys.Mem2         { return gmem2 }
+func (t *targetrunner) GetFSPRG() fs.PathRunGroup     { return &t.fsprg }
 
 //===========================================================================================
 //
@@ -365,20 +462,19 @@ func (t *targetrunner) httpbckget(w http.ResponseWriter, r *http.Request) {
 // check whether the object exists locally. Version is checked as well if configured.
 func (t *targetrunner) httpobjget(w http.ResponseWriter, r *http.Request) {
 	var (
-		nhobj                         cksumvalue
-		bucket, objname, fqn          string
-		uname, errstr, version        string
-		size, rangeOff, rangeLen      int64
-		props                         *objectProps
-		started                       time.Time
-		errcode                       int
-		coldget, vchanged, inNextTier bool
-		err                           error
-		file                          *os.File
-		written                       int64
+		bucket, objname    string
+		errstr             string
+		rangeOff, rangeLen int64
+		lom                *cluster.LOM
+		started            time.Time
+		config             = cmn.GCO.Get()
+		versioncfg         = &config.Ver
+		ct                 = t.contextWithAuth(r)
+		errcode            int
+		coldget, vchanged  bool
 	)
 	//
-	// 1. start, validate, readahead
+	// 1. start, init lom, readahead
 	//
 	started = time.Now()
 	apitems, err := t.checkRESTItems(w, r, 2, false, cmn.Version, cmn.Objects)
@@ -395,162 +491,172 @@ func (t *targetrunner) httpobjget(w http.ResponseWriter, r *http.Request) {
 		t.invalmsghdlr(w, r, errstr)
 		return
 	}
-	bucketmd := t.bmdowner.get()
-	islocal := bucketmd.islocal(bucket)
-	fqn, errstr = cluster.FQN(bucket, objname, islocal)
-	if errstr != "" {
+	lom = &cluster.LOM{T: t, Bucket: bucket, Objname: objname}
+	if errstr = lom.Fill(cluster.LomFstat); errstr != "" { // (doesnotexist -> ok, other)
 		t.invalmsghdlr(w, r, errstr)
 		return
 	}
-	if !dryRun.disk {
+	if !dryRun.disk && lom.Exists() {
 		if x := query.Get(cmn.URLParamReadahead); x != "" { // FIXME
-			t.readahead.ahead(fqn, rangeOff, rangeLen)
+			t.readahead.ahead(lom.Fqn, rangeOff, rangeLen)
 			return
 		}
 	}
 	if glog.V(4) {
 		pid := query.Get(cmn.URLParamProxyID)
-		glog.Infof("%s %s/%s <= %s", r.Method, bucket, objname, pid)
+		glog.Infof("%s %s <= %s", r.Method, lom, pid)
 	}
 	if redelta := t.redirectLatency(started, query); redelta != 0 {
-		t.statsif.add(statGetRedirLatency, redelta)
+		t.statsif.Add(stats.GetRedirLatency, redelta)
 	}
-	errstr, errcode = t.checkIsLocal(bucket, bucketmd, query, islocal)
+	errstr, errcode = t.IsBucketLocal(bucket, lom.Bucketmd, query, lom.Bislocal)
 	if errstr != "" {
 		t.invalmsghdlr(w, r, errstr, errcode)
 		return
 	}
 	//
-	// 2. coldget, maybe
+	// 2. under lock: versioning, checksum, restore from cluster
 	//
-	var (
-		cksumcfg   = &ctx.config.Cksum
-		versioncfg = &ctx.config.Ver
-		ct         = t.contextWithAuth(r)
-	)
-	// Lock(ro)
-	uname = cluster.Uname(bucket, objname)
-	t.rtnamemap.Lock(uname, false)
+	t.rtnamemap.Lock(lom.Uname, false)
 
-	// bucket-level checksumming should override global
-	if bucketProps, _, defined := bucketmd.propsAndChecksum(bucket); defined {
-		cksumcfg = &bucketProps.CksumConfig
-	}
-
-	// existence, access & versioning
-	if coldget, size, version, errstr = t.lookupLocally(bucket, objname, fqn); islocal && errstr != "" {
-		errcode = http.StatusInternalServerError
-		// given certain conditions (below) make an effort to locate the object
-		if strings.Contains(errstr, doesnotexist) {
-			errcode = http.StatusNotFound
-
-			// check FS-wide (local rebalance is running)
-			aborted, running := t.xactinp.isAbortedOrRunningLocalRebalance()
-			if aborted || running {
-				oldFQN, oldSize := t.getFromNeighborFS(bucket, objname, islocal)
-				if oldFQN != "" {
-					if glog.V(4) {
-						glog.Infof("Local rebalance is not completed: file found at %s [size %s]",
-							oldFQN, cmn.B2S(oldSize, 1))
-					}
-					fqn = oldFQN
-					size = oldSize
-					goto existslocally
-				}
-			}
-
-			// check cluster-wide (global rebalance is running)
-			aborted, running = t.xactinp.isAbortedOrRunningRebalance()
-			if aborted || running {
-				if props := t.getFromNeighbor(bucket, objname, r, islocal); props != nil {
-					size, nhobj = props.size, props.nhobj
-					if glog.V(4) {
-						glog.Infof("Rebalance is not completed: found somewhere [size %s]", cmn.B2S(size, 1))
-					}
-					goto existslocally
-				}
-			} else {
-				_, p := bucketmd.get(bucket, islocal)
-				if p.NextTierURL != "" {
-					if inNextTier, errstr, errcode = t.objectInNextTier(p.NextTierURL, bucket, objname); inNextTier {
-						props, errstr, errcode = t.getObjectNextTier(p.NextTierURL, bucket, objname, fqn)
-						if errstr == "" {
-							size, nhobj = props.size, props.nhobj
-							goto existslocally
-						}
-						glog.Errorf("Error getting object from next tier after successful lookup, err: %s,"+
-							" HTTP status code: %d", errstr, errcode)
-					}
-				}
-			}
+	if lom.Exists() {
+		if errstr = lom.Fill(cluster.LomVersion | cluster.LomCksum); errstr != "" {
+			t.rtnamemap.Unlock(lom.Uname, false)
+			t.invalmsghdlr(w, r, errstr)
+			return
 		}
+	}
+	if lom.Doesnotexist && lom.Bislocal { // does not exist in the local bucket: restore from neighbors
+		if errstr, errcode = t.restoreObjLocalBucket(lom, r); errstr == "" {
+			t.objGetComplete(w, r, lom, started, rangeOff, rangeLen, false)
+			t.rtnamemap.Unlock(lom.Uname, false)
+			return
+		}
+		t.rtnamemap.Unlock(lom.Uname, false)
 		t.invalmsghdlr(w, r, errstr, errcode)
-		t.rtnamemap.Unlock(uname, false)
 		return
 	}
-
-	if !coldget && !islocal {
-		if versioncfg.ValidateWarmGet && (version != "" &&
-			t.versioningConfigured(bucket)) {
-			if vchanged, errstr, errcode = t.checkCloudVersion(
-				ct, bucket, objname, version); errstr != "" {
+	coldget = lom.Doesnotexist
+	if !coldget && !lom.Bislocal { // exists && cloud-bucket: check ver if requested
+		if versioncfg.ValidateWarmGet && (lom.Version != "" && versioningConfigured(lom.Bislocal)) {
+			if vchanged, errstr, errcode = t.checkCloudVersion(ct, bucket, objname, lom.Version); errstr != "" {
+				t.rtnamemap.Unlock(lom.Uname, false)
 				t.invalmsghdlr(w, r, errstr, errcode)
-				t.rtnamemap.Unlock(uname, false)
 				return
 			}
-			// TODO: add a knob to return what's cached while upgrading the version async
 			coldget = vchanged
 		}
 	}
-	if !coldget && cksumcfg.ValidateWarmGet && cksumcfg.Checksum != cmn.ChecksumNone {
-		validChecksum, errstr := t.validateObjectChecksum(fqn, cksumcfg.Checksum, size)
-		if errstr != "" {
-			t.invalmsghdlr(w, r, errstr, http.StatusInternalServerError)
-			t.rtnamemap.Unlock(uname, false)
-			return
-		}
-		if !validChecksum {
-			if islocal {
-				if err := os.Remove(fqn); err != nil {
-					glog.Warningf("Bad checksum, failed to remove %s/%s, err: %v", bucket, objname, err)
+	// checksum validation, if requested
+	if !coldget && lom.Cksumcfg.ValidateWarmGet {
+		errstr = lom.Fill(cluster.LomCksum | cluster.LomCksumPresentRecomp | cluster.LomCksumMissingRecomp)
+		if lom.Badchecksum {
+			glog.Errorln(errstr)
+			if lom.Bislocal {
+				if err := os.Remove(lom.Fqn); err != nil {
+					glog.Warningf("%s - failed to remove, err: %v", errstr, err)
 				}
-				t.invalmsghdlr(w, r, fmt.Sprintf("Bad checksum %s/%s", bucket, objname), http.StatusInternalServerError)
-				t.rtnamemap.Unlock(uname, false)
+				t.rtnamemap.Unlock(lom.Uname, false)
+				t.invalmsghdlr(w, r, errstr, http.StatusInternalServerError)
 				return
 			}
 			coldget = true
+		} else if errstr != "" {
+			t.rtnamemap.Unlock(lom.Uname, false)
+			t.invalmsghdlr(w, r, errstr, http.StatusInternalServerError)
+			return
 		}
 	}
+	//
+	// 3. coldget
+	//
 	if coldget && !dryRun.disk {
-		t.rtnamemap.Unlock(uname, false)
-		if props, errstr, errcode = t.coldget(ct, bucket, objname, false); errstr != "" {
-			if errcode == 0 {
-				t.invalmsghdlr(w, r, errstr)
-			} else {
-				t.invalmsghdlr(w, r, errstr, errcode)
+		t.rtnamemap.Unlock(lom.Uname, false)
+		if errstr, errcode := t.getCold(ct, lom, false); errstr != "" {
+			t.invalmsghdlr(w, r, errstr, errcode)
+			return
+		}
+	}
+	// 4. finally
+	t.objGetComplete(w, r, lom, started, rangeOff, rangeLen, coldget)
+	t.rtnamemap.Unlock(lom.Uname, false)
+}
+
+//
+// 3a. attempt to restore an object that is missing in the LOCAL BUCKET - from:
+//     1) local FS, 2) this cluster, 3) other tiers in the DC
+// FIXME: must be done => (getfqn, and under write lock)
+//
+func (t *targetrunner) restoreObjLocalBucket(lom *cluster.LOM, r *http.Request) (errstr string, errcode int) {
+	// check FS-wide if local rebalance is running
+	aborted, running := t.xactions.isAbortedOrRunningLocalRebalance()
+	if aborted || running {
+		oldFQN, oldSize := t.getFromOtherLocalFS(lom.Bucket, lom.Objname, lom.Bislocal)
+		if oldFQN != "" {
+			if glog.V(4) {
+				glog.Infof("Restored (local rebalance in-progress?): %s (%s)", oldFQN, cmn.B2S(oldSize, 1))
+			}
+			lom.Fqn = oldFQN
+			lom.Size = oldSize
+			return
+		}
+	}
+	// check cluster-wide when global rebalance is running
+	aborted, running = t.xactions.isAbortedOrRunningRebalance()
+	if aborted || running {
+		if props, errs := t.getFromNeighbor(r, lom); errs == "" {
+			lom.RestoredReceived(props)
+			if glog.V(4) {
+				glog.Infof("Restored (global rebalance in-progress?): %s (%s)", lom, cmn.B2S(lom.Size, 1))
 			}
 			return
 		}
-		size, nhobj = props.size, props.nhobj
+	} else {
+		if lom.Bprops != nil && lom.Bprops.NextTierURL != "" {
+			var (
+				props      *cluster.LOM
+				inNextTier bool
+			)
+			if inNextTier, errstr, errcode = t.objectInNextTier(lom.Bprops.NextTierURL, lom.Bucket, lom.Objname); inNextTier {
+				if props, errstr, errcode = t.getObjectNextTier(lom.Bprops.NextTierURL, lom.Bucket, lom.Objname, lom.Fqn); errstr == "" {
+					lom.RestoredReceived(props)
+					return
+				}
+			}
+		}
 	}
+	s := fmt.Sprintf("GET local: %s(%s) %s", lom, lom.Fqn, cmn.DoesNotExist)
+	if errstr != "" {
+		errstr = s + " => [" + errstr + "]"
+	} else {
+		errstr = s
+	}
+	if errcode == 0 {
+		errcode = http.StatusNotFound
+	}
+	return
+}
 
-	//
-	// 3. read local, write http (note: coldget() keeps the read lock if successful)
-	//
-existslocally:
+//
+// 4. read local, write http (note: coldget() keeps the read lock if successful)
+//
+func (t *targetrunner) objGetComplete(w http.ResponseWriter, r *http.Request, lom *cluster.LOM, started time.Time,
+	rangeOff, rangeLen int64, coldget bool) {
 	var (
+		file               *os.File
 		sgl                *memsys.SGL
 		slab               *memsys.Slab2
 		buf                []byte
 		rangeReader        io.ReadSeeker
 		reader             io.Reader
-		rahSize            int64
-		rahfcacher, rahsgl = t.readahead.get(fqn)
+		rahSize, written   int64
+		err                error
+		errstr             string
+		rahfcacher, rahsgl = t.readahead.get(lom.Fqn)
 		sendMore           bool
 	)
 	defer func() {
 		rahfcacher.got()
-		t.rtnamemap.Unlock(uname, false)
 		if file != nil {
 			file.Close()
 		}
@@ -562,20 +668,14 @@ existslocally:
 		}
 	}()
 
-	cksumRange := cksumcfg.Checksum != cmn.ChecksumNone && rangeLen > 0 && cksumcfg.EnableReadRangeChecksum
-	if !coldget && !cksumRange && cksumcfg.Checksum != cmn.ChecksumNone {
-		xxHashBinary, errstr := Getxattr(fqn, cmn.XattrXXHashVal)
-		if errstr == "" && xxHashBinary != nil {
-			nhobj = newcksumvalue(cksumcfg.Checksum, string(xxHashBinary))
-		}
-	}
-	if nhobj != nil && !cksumRange {
-		htype, hval := nhobj.get()
+	cksumRange := lom.Cksumcfg.Checksum != cmn.ChecksumNone && rangeLen > 0 && lom.Cksumcfg.EnableReadRangeChecksum
+	if lom.Nhobj != nil && !cksumRange {
+		htype, hval := lom.Nhobj.Get()
 		w.Header().Add(cmn.HeaderDFCChecksumType, htype)
 		w.Header().Add(cmn.HeaderDFCChecksumVal, hval)
 	}
-	if props != nil && props.version != "" {
-		w.Header().Add(cmn.HeaderDFCObjVersion, props.version)
+	if lom.Version != "" {
+		w.Header().Add(cmn.HeaderDFCObjVersion, lom.Version)
 	}
 
 	// loopback if disk IO is disabled
@@ -583,39 +683,41 @@ existslocally:
 		if !dryRun.network {
 			rd := readers.NewRandReader(dryRun.size)
 			if _, err = io.Copy(w, rd); err != nil {
+				// NOTE: Cannot return invalid handler because it will be double header write
 				errstr = fmt.Sprintf("dry-run: failed to send random response, err: %v", err)
-				t.statsif.add(statErrGetCount, 1)
+				glog.Error(errstr)
+				t.statsif.Add(stats.ErrGetCount, 1)
 				return
 			}
 		}
 
 		delta := time.Since(started)
-		t.statsif.addMany(namedVal64{statGetCount, 1}, namedVal64{statGetLatency, int64(delta)})
+		t.statsif.AddMany(stats.NamedVal64{stats.GetCount, 1}, stats.NamedVal64{stats.GetLatency, int64(delta)})
 		return
 	}
-	if size == 0 {
-		glog.Warningf("%s/%s size is 0 (zero)", bucket, objname)
+	if lom.Size == 0 {
+		glog.Warningf("%s size=0(zero)", lom) // TODO: optimize out much of the below
 		return
 	}
 	if rahsgl != nil {
 		rahSize = rahsgl.Size()
 		if rangeLen == 0 {
-			sendMore = rahSize < size
+			sendMore = rahSize < lom.Size
 		} else {
 			sendMore = rahSize < rangeLen
 		}
 	}
 	if rahSize == 0 || sendMore {
-		file, err = os.Open(fqn)
+		file, err = os.Open(lom.Fqn)
 		if err != nil {
 			if os.IsPermission(err) {
-				errstr = fmt.Sprintf("Permission to access %s denied, err: %v", fqn, err)
+				errstr = fmt.Sprintf("Permission to access %s denied, err: %v", lom.Fqn, err)
 				t.invalmsghdlr(w, r, errstr, http.StatusForbidden)
 			} else {
-				errstr = fmt.Sprintf("Failed to open %s, err: %v", fqn, err)
+				errstr = fmt.Sprintf("Failed to open %s, err: %v", lom.Fqn, err)
 				t.invalmsghdlr(w, r, errstr, http.StatusInternalServerError)
 			}
-			t.fshc(err, fqn)
+			t.fshc(err, lom.Fqn)
 			return
 		}
 	}
@@ -626,13 +728,13 @@ send:
 		reader = rahsgl
 		slab = rahsgl.Slab()
 		buf = slab.Alloc()
-		glog.Infof("%s readahead %d", fqn, rahSize) // FIXME: DEBUG
+		glog.Infof("%s readahead %d", lom.Fqn, rahSize) // FIXME: DEBUG
 	} else if rangeLen == 0 {
 		if rahSize > 0 {
 			file.Seek(rahSize, io.SeekStart)
 		}
 		reader = file
-		buf, slab = gmem2.AllocFromSlab2(size)
+		buf, slab = gmem2.AllocFromSlab2(lom.Size)
 	} else {
 		if rahSize > 0 {
 			rangeOff += rahSize
@@ -642,14 +744,14 @@ send:
 		if cksumRange {
 			cmn.Assert(rahSize == 0, "NOT IMPLEMENTED YET") // TODO
 			var cksum string
-			cksum, sgl, rangeReader, errstr = t.rangeCksum(file, fqn, rangeOff, rangeLen, buf)
+			cksum, sgl, rangeReader, errstr = t.rangeCksum(file, lom.Fqn, rangeOff, rangeLen, buf)
 			if errstr != "" {
 				t.invalmsghdlr(w, r, errstr, http.StatusInternalServerError)
 				return
 
 			}
 			reader = rangeReader
-			w.Header().Add(cmn.HeaderDFCChecksumType, cksumcfg.Checksum)
+			w.Header().Add(cmn.HeaderDFCChecksumType, lom.Cksumcfg.Checksum)
 			w.Header().Add(cmn.HeaderDFCChecksumVal, cksum)
 		} else {
 			reader = io.NewSectionReader(file, rangeOff, rangeLen)
@@ -663,12 +765,13 @@ send:
 	}
 	if err != nil {
 		if !dryRun.network {
-			errstr = fmt.Sprintf("Failed to GET %s, err: %v", fqn, err)
+			errstr = fmt.Sprintf("Failed to GET %s, err: %v", lom.Fqn, err)
 		} else {
-			errstr = fmt.Sprintf("dry-run: failed to read/discard %s, err: %v", fqn, err)
+			errstr = fmt.Sprintf("dry-run: failed to read/discard %s, err: %v", lom.Fqn, err)
 		}
-		t.fshc(err, fqn)
-		t.statsif.add(statErrGetCount, 1)
+		glog.Error(errstr)
+		t.fshc(err, lom.Fqn)
+		t.statsif.Add(stats.ErrGetCount, 1)
 		return
 	}
 	if sendMore {
@@ -677,11 +780,11 @@ send:
 		goto send
 	}
 
-	if !coldget && bucketmd.lruEnabled(bucket) {
-		getatimerunner().touch(fqn)
+	if !coldget && lom.LRUenabled() {
+		getatimerunner().Touch(lom.Fqn)
 	}
 	if glog.V(4) {
-		s := fmt.Sprintf("GET: %s/%s, %.2f MB, %d µs", bucket, objname, float64(written)/cmn.MiB, time.Since(started)/1000)
+		s := fmt.Sprintf("GET: %s(%s), %d µs", lom, cmn.B2S(written, 1), int64(time.Since(started)/time.Microsecond))
 		if coldget {
 			s += " (cold)"
 		}
@@ -689,7 +792,7 @@ send:
 	}
 
 	delta := time.Since(started)
-	t.statsif.addMany(namedVal64{statGetCount, 1}, namedVal64{statGetLatency, int64(delta)})
+	t.statsif.AddMany(stats.NamedVal64{stats.GetCount, 1}, stats.NamedVal64{stats.GetLatency, int64(delta)})
 }
 
 func (t *targetrunner) rangeCksum(file *os.File, fqn string, offset, length int64, buf []byte) (
@@ -766,7 +869,7 @@ func (t *targetrunner) httpobjput(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		if redelta := t.redirectLatency(time.Now(), query); redelta != 0 {
-			t.statsif.add(statPutRedirLatency, redelta)
+			t.statsif.Add(stats.PutRedirLatency, redelta)
 		}
 		// PUT
 		pid := query.Get(cmn.URLParamProxyID)
@@ -782,21 +885,9 @@ func (t *targetrunner) httpobjput(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		errstr := ""
-		errcode := 0
-		if replica, replicaSrc := isReplicationPUT(r); !replica {
-			// regular PUT
-			errstr, errcode = t.doput(w, r, bucket, objname)
-		} else {
-			// replication PUT
-			errstr = t.doReplicationPut(w, r, bucket, objname, replicaSrc)
-		}
+		errstr, errcode := t.doPut(r, bucket, objname)
 		if errstr != "" {
-			if errcode == 0 {
-				t.invalmsghdlr(w, r, errstr)
-			} else {
-				t.invalmsghdlr(w, r, errstr, errcode)
-			}
+			t.invalmsghdlr(w, r, errstr, errcode)
 		}
 	}
 }
@@ -820,7 +911,7 @@ func (t *targetrunner) httpbckdelete(w http.ResponseWriter, r *http.Request) {
 	b, err := ioutil.ReadAll(r.Body)
 	defer func() {
 		if ok && err == nil && bool(glog.V(4)) {
-			glog.Infof("DELETE list|range: %s, %d µs", bucket, time.Since(started)/1000)
+			glog.Infof("DELETE list|range: %s, %d µs", bucket, int64(time.Since(started)/time.Microsecond))
 		}
 	}()
 	if err == nil && len(b) > 0 {
@@ -868,7 +959,7 @@ func (t *targetrunner) httpobjdelete(w http.ResponseWriter, r *http.Request) {
 	b, err := ioutil.ReadAll(r.Body)
 	defer func() {
 		if ok && err == nil && bool(glog.V(4)) {
-			glog.Infof("DELETE: %s/%s, %d µs", bucket, objname, time.Since(started)/1000)
+			glog.Infof("DELETE: %s/%s, %d µs", bucket, objname, int64(time.Since(started)/time.Microsecond))
 		}
 	}()
 	if err == nil && len(b) > 0 {
@@ -904,7 +995,7 @@ func (t *targetrunner) httpobjdelete(w http.ResponseWriter, r *http.Request) {
 func (t *targetrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	var msg cmn.ActionMsg
-	if t.readJSON(w, r, &msg) != nil {
+	if cmn.ReadJSON(w, r, &msg) != nil {
 		return
 	}
 	apitems, err := t.checkRESTItems(w, r, 1, false, cmn.Version, cmn.Buckets)
@@ -923,21 +1014,27 @@ func (t *targetrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		bucketFrom, bucketTo := lbucket, msg.Name
+
+		t.bmdowner.Lock() // lock#1 begin
+
 		bucketmd := t.bmdowner.get()
-		ok, props := bucketmd.get(bucketFrom, true)
+		props, ok := bucketmd.Get(bucketFrom, true)
 		if !ok {
-			s := fmt.Sprintf("Local bucket %s does not exist", bucketFrom)
+			t.bmdowner.Unlock()
+			s := fmt.Sprintf("Local bucket %s %s", bucketFrom, cmn.DoesNotExist)
 			t.invalmsghdlr(w, r, s)
 			return
 		}
 		bmd4ren, ok := msg.Value.(map[string]interface{})
 		if !ok {
+			t.bmdowner.Unlock()
 			t.invalmsghdlr(w, r, fmt.Sprintf("Unexpected Value format %+v, %T", msg.Value, msg.Value))
 			return
 		}
 		v1, ok1 := bmd4ren["version"]
 		v2, ok2 := v1.(float64)
 		if !ok1 || !ok2 {
+			t.bmdowner.Unlock()
 			t.invalmsghdlr(w, r, fmt.Sprintf("Invalid Value format (%+v, %T), (%+v, %T)", v1, v1, v2, v2))
 			return
 		}
@@ -946,10 +1043,20 @@ func (t *targetrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 			glog.Warningf("bucket-metadata version %d != %d - proceeding to rename anyway", bucketmd.version(), version)
 		}
 		clone := bucketmd.clone()
-		if errstr := t.renameLB(bucketFrom, bucketTo, props, clone); errstr != "" {
+		clone.LBmap[bucketTo] = props
+		t.bmdowner.put(clone) // bmd updated with an added bucket, lock#1 end
+		t.bmdowner.Unlock()
+
+		if errstr := t.renameLB(bucketFrom, bucketTo); errstr != "" {
 			t.invalmsghdlr(w, r, errstr)
 			return
 		}
+
+		t.bmdowner.Lock() // lock#2 begin
+		bucketmd = t.bmdowner.get()
+		bucketmd.del(bucketFrom, true) // TODO: resolve conflicts
+		t.bmdowner.Unlock()
+
 		glog.Infof("renamed local bucket %s => %s, bucket-metadata version %d", bucketFrom, bucketTo, clone.version())
 	case cmn.ActListObjects:
 		lbucket := apitems[0]
@@ -960,8 +1067,8 @@ func (t *targetrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 		tag, ok := t.listbucket(w, r, lbucket, &msg)
 		if ok {
 			delta := time.Since(started)
-			t.statsif.addMany(namedVal64{statListCount, 1}, namedVal64{statListLatency, int64(delta)})
-			if glog.V(3) {
+			t.statsif.AddMany(stats.NamedVal64{stats.ListCount, 1}, stats.NamedVal64{stats.ListLatency, int64(delta)})
+			if glog.V(4) {
 				glog.Infof("LIST %s: %s, %d µs", tag, lbucket, int64(delta/time.Microsecond))
 			}
 		}
@@ -980,7 +1087,7 @@ func (t *targetrunner) httpbckpost(w http.ResponseWriter, r *http.Request) {
 // POST /v1/objects/bucket-name/object-name
 func (t *targetrunner) httpobjpost(w http.ResponseWriter, r *http.Request) {
 	var msg cmn.ActionMsg
-	if t.readJSON(w, r, &msg) != nil {
+	if cmn.ReadJSON(w, r, &msg) != nil {
 		return
 	}
 	switch msg.Action {
@@ -1001,7 +1108,7 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 		errstr      string
 		errcode     int
 		bucketprops cmn.SimpleKVs
-		cksumcfg    *cmn.CksumConfig
+		cksumcfg    *cmn.CksumConf
 	)
 	apitems, err := t.checkRESTItems(w, r, 1, false, cmn.Version, cmn.Buckets)
 	if err != nil {
@@ -1017,8 +1124,8 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 		glog.Infof("%s %s <= %s", r.Method, bucket, pid)
 	}
 	bucketmd := t.bmdowner.get()
-	islocal = bucketmd.islocal(bucket)
-	errstr, errcode = t.checkIsLocal(bucket, bucketmd, query, islocal)
+	islocal = bucketmd.IsLocal(bucket)
+	errstr, errcode = t.IsBucketLocal(bucket, &bucketmd.BMD, query, islocal)
 	if errstr != "" {
 		t.invalmsghdlr(w, r, errstr, errcode)
 		return
@@ -1027,11 +1134,7 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 	if !islocal {
 		bucketprops, errstr, errcode = getcloudif().headbucket(t.contextWithAuth(r), bucket)
 		if errstr != "" {
-			if errcode == 0 {
-				t.invalmsghdlr(w, r, errstr)
-			} else {
-				t.invalmsghdlr(w, r, errstr, errcode)
-			}
+			t.invalmsghdlr(w, r, errstr, errcode)
 			return
 		}
 	} else {
@@ -1040,7 +1143,7 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 		bucketprops[cmn.HeaderVersioning] = cmn.VersionLocal
 	}
 	// double check if we support versioning internally for the bucket
-	if !t.versioningConfigured(bucket) {
+	if !versioningConfigured(islocal) {
 		bucketprops[cmn.HeaderVersioning] = cmn.VersionNone
 	}
 
@@ -1050,9 +1153,9 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 
 	props, _, defined := bucketmd.propsAndChecksum(bucket)
 	// include checksumming settings in the response
-	cksumcfg = &ctx.config.Cksum
+	cksumcfg = &cmn.GCO.Get().Cksum
 	if defined {
-		cksumcfg = &props.CksumConfig
+		cksumcfg = &props.CksumConf
 	}
 
 	// include lru settings in the response
@@ -1065,7 +1168,7 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add(cmn.HeaderBucketValidateRange, strconv.FormatBool(cksumcfg.EnableReadRangeChecksum))
 	w.Header().Add(cmn.HeaderBucketLRULowWM, strconv.FormatUint(uint64(props.LowWM), 10))
 	w.Header().Add(cmn.HeaderBucketLRUHighWM, strconv.FormatUint(uint64(props.HighWM), 10))
-	w.Header().Add(cmn.HeaderBucketAtimeCacheMax, strconv.FormatUint(props.AtimeCacheMax, 10))
+	w.Header().Add(cmn.HeaderBucketAtimeCacheMax, strconv.FormatInt(props.AtimeCacheMax, 10))
 	w.Header().Add(cmn.HeaderBucketDontEvictTime, props.DontEvictTimeStr)
 	w.Header().Add(cmn.HeaderBucketCapUpdTime, props.CapacityUpdTimeStr)
 	w.Header().Add(cmn.HeaderBucketLRUEnabled, strconv.FormatBool(props.LRUEnabled))
@@ -1075,7 +1178,7 @@ func (t *targetrunner) httpbckhead(w http.ResponseWriter, r *http.Request) {
 func (t *targetrunner) httpobjhead(w http.ResponseWriter, r *http.Request) {
 	var (
 		bucket, objname, errstr string
-		islocal, checkCached    bool
+		checkCached             bool
 		errcode                 int
 		objmeta                 cmn.SimpleKVs
 	)
@@ -1088,29 +1191,23 @@ func (t *targetrunner) httpobjhead(w http.ResponseWriter, r *http.Request) {
 	if !t.validatebckname(w, r, bucket) {
 		return
 	}
+	lom := &cluster.LOM{T: t, Bucket: bucket, Objname: objname}
+	if errstr = lom.Fill(cluster.LomFstat | cluster.LomVersion); errstr != "" { // (doesnotexist -> ok, other)
+		t.invalmsghdlr(w, r, errstr)
+		return
+	}
 	query := r.URL.Query()
 	if glog.V(4) {
 		pid := query.Get(cmn.URLParamProxyID)
-		glog.Infof("%s %s/%s <= %s", r.Method, bucket, objname, pid)
+		glog.Infof("%s %s <= %s", r.Method, lom, pid)
 	}
-	bucketmd := t.bmdowner.get()
-	islocal = bucketmd.islocal(bucket)
-	errstr, errcode = t.checkIsLocal(bucket, bucketmd, query, islocal)
+	errstr, errcode = t.IsBucketLocal(bucket, lom.Bucketmd, query, lom.Bislocal)
 	if errstr != "" {
 		t.invalmsghdlr(w, r, errstr, errcode)
 		return
 	}
-	if islocal || checkCached {
-		fqn, errstr := cluster.FQN(bucket, objname, islocal)
-		if errstr != "" {
-			t.invalmsghdlr(w, r, errstr)
-			return
-		}
-		var (
-			size    int64
-			version string
-		)
-		if _, size, version, errstr = t.lookupLocally(bucket, objname, fqn); errstr != "" {
+	if lom.Bislocal || checkCached {
+		if lom.Doesnotexist {
 			status := http.StatusNotFound
 			http.Error(w, http.StatusText(status), status)
 			return
@@ -1118,17 +1215,15 @@ func (t *targetrunner) httpobjhead(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		objmeta = make(cmn.SimpleKVs)
-		objmeta["size"] = strconv.FormatInt(size, 10)
-		objmeta["version"] = version
-		glog.Infoln("httpobjhead FOUND:", bucket, objname, size, version)
+		objmeta["size"] = strconv.FormatInt(lom.Size, 10)
+		objmeta["version"] = lom.Version
+		if glog.V(4) {
+			glog.Infof("%s(%s), ver=%s", lom, cmn.B2S(lom.Size, 1), lom.Version)
+		}
 	} else {
 		objmeta, errstr, errcode = getcloudif().headobject(t.contextWithAuth(r), bucket, objname)
 		if errstr != "" {
-			if errcode == 0 {
-				t.invalmsghdlr(w, r, errstr)
-			} else {
-				t.invalmsghdlr(w, r, errstr, errcode)
-			}
+			t.invalmsghdlr(w, r, errstr, errcode)
 			return
 		}
 	}
@@ -1160,7 +1255,7 @@ func (t *targetrunner) metasyncHandler(w http.ResponseWriter, r *http.Request) {
 // PUT /v1/metasync
 func (t *targetrunner) metasyncHandlerPut(w http.ResponseWriter, r *http.Request) {
 	var payload = make(cmn.SimpleKVs)
-	if err := t.readJSON(w, r, &payload); err != nil {
+	if err := cmn.ReadJSON(w, r, &payload); err != nil {
 		t.invalmsghdlr(w, r, err.Error())
 		return
 	}
@@ -1205,9 +1300,9 @@ func (t *targetrunner) healthHandler(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	from := query.Get(cmn.URLParamFromID)
 
-	aborted, running := t.xactinp.isAbortedOrRunningRebalance()
+	aborted, running := t.xactions.isAbortedOrRunningRebalance()
 	if !aborted && !running {
-		aborted, running = t.xactinp.isAbortedOrRunningLocalRebalance()
+		aborted, running = t.xactions.isAbortedOrRunningLocalRebalance()
 	}
 	status := &thealthstatus{IsRebalancing: aborted || running}
 
@@ -1275,31 +1370,30 @@ func (t *targetrunner) pushHandler(w http.ResponseWriter, r *http.Request) {
 // supporting methods and misc
 //
 //====================================================================================
-func (t *targetrunner) renameLB(bucketFrom, bucketTo string, p cmn.BucketProps, clone *bucketMD) (errstr string) {
+func (t *targetrunner) renameLB(bucketFrom, bucketTo string) (errstr string) {
 	// ready to receive migrated obj-s _after_ that point
 	// insert directly w/o incrementing the version (metasyncer will do at the end of the operation)
-	clone.LBmap[bucketTo] = p
-	t.bmdowner.put(clone)
-
 	wg := &sync.WaitGroup{}
 
-	availablePaths, _ := fs.Mountpaths.Mountpaths()
-	ch := make(chan string, len(availablePaths))
-	for _, mpathInfo := range availablePaths {
-		// Create directory for new local bucket
-		toDir := filepath.Join(fs.Mountpaths.MakePathLocal(mpathInfo.Path), bucketTo)
-		if err := cmn.CreateDir(toDir); err != nil {
-			ch <- fmt.Sprintf("Failed to create dir %s, error: %v", toDir, err)
-			continue
-		}
+	availablePaths, _ := fs.Mountpaths.Get()
+	ch := make(chan string, len(fs.CSM.RegisteredContentTypes)*len(availablePaths))
+	for contentType := range fs.CSM.RegisteredContentTypes {
+		for _, mpathInfo := range availablePaths {
+			// Create directory for new local bucket
+			toDir := filepath.Join(fs.Mountpaths.MakePathLocal(mpathInfo.Path, contentType), bucketTo)
+			if err := cmn.CreateDir(toDir); err != nil {
+				ch <- fmt.Sprintf("Failed to create dir %s, error: %v", toDir, err)
+				continue
+			}
 
-		wg.Add(1)
-		fromdir := filepath.Join(fs.Mountpaths.MakePathLocal(mpathInfo.Path), bucketFrom)
-		go func(fromdir string, wg *sync.WaitGroup) {
-			time.Sleep(time.Millisecond * 100) // FIXME: 2-phase for the targets to 1) prep (above) and 2) rebalance
-			ch <- t.renameOne(fromdir, bucketFrom, bucketTo)
-			wg.Done()
-		}(fromdir, wg)
+			wg.Add(1)
+			fromDir := filepath.Join(fs.Mountpaths.MakePathLocal(mpathInfo.Path, contentType), bucketFrom)
+			go func(fromDir string) {
+				time.Sleep(time.Millisecond * 100) // FIXME: 2-phase for the targets to 1) prep (above) and 2) rebalance
+				ch <- t.renameOne(fromDir, bucketFrom, bucketTo)
+				wg.Done()
+			}(fromDir)
+		}
 	}
 	wg.Wait()
 	close(ch)
@@ -1308,13 +1402,7 @@ func (t *targetrunner) renameLB(bucketFrom, bucketTo string, p cmn.BucketProps, 
 			return
 		}
 	}
-	for _, mpathInfo := range availablePaths {
-		fromdir := filepath.Join(fs.Mountpaths.MakePathLocal(mpathInfo.Path), bucketFrom)
-		if err := os.RemoveAll(fromdir); err != nil {
-			glog.Errorf("Failed to remove dir %s", fromdir)
-		}
-	}
-	clone.del(bucketFrom, true)
+	removeBuckets("rename", bucketFrom)
 	return
 }
 
@@ -1335,16 +1423,19 @@ func (renctx *renamectx) walkf(fqn string, osfi os.FileInfo, err error) error {
 	if osfi.Mode().IsDir() {
 		return nil
 	}
-	if spec, _ := cluster.FileSpec(fqn); spec != nil && !spec.PermToProcess() { // FIXME: workfiles indicate work in progress..
+	// FIXME: workfiles indicate work in progress. Renaming could break ongoing
+	// operations and not renaming it probably result in having file in wrong directory.
+	if !fs.CSM.PermToProcess(fqn) {
 		return nil
 	}
-	bucket, objname, err := renctx.t.fqn2bckobj(fqn)
+	parsedFQN, _, err := cluster.ResolveFQN(fqn, nil, true /* bucket is local */)
+	contentType, bucket, objname := parsedFQN.ContentType, parsedFQN.Bucket, parsedFQN.Objname
 	if err == nil {
 		if bucket != renctx.bucketFrom {
 			return fmt.Errorf("Unexpected: bucket %s != %s bucketFrom", bucket, renctx.bucketFrom)
 		}
 	}
-	if errstr := renctx.t.renameobject(bucket, objname, renctx.bucketTo, objname); errstr != "" {
+	if errstr := renctx.t.renameObject(contentType, bucket, objname, renctx.bucketTo, objname); errstr != "" {
 		return fmt.Errorf(errstr)
 	}
 	return nil
@@ -1368,179 +1459,158 @@ func (t *targetrunner) checkCloudVersion(ct context.Context, bucket, objname, ve
 	return
 }
 
-func (t *targetrunner) getFromNeighbor(bucket, objname string, r *http.Request, islocal bool) (props *objectProps) {
-	neighsi := t.lookupRemotely(bucket, objname)
+func (t *targetrunner) getFromNeighbor(r *http.Request, lom *cluster.LOM) (props *cluster.LOM, errstr string) {
+	neighsi := t.lookupRemotely(lom.Bucket, lom.Objname)
 	if neighsi == nil {
+		errstr = fmt.Sprintf("Failed cluster-wide lookup %s", lom)
 		return
 	}
 	if glog.V(4) {
-		glog.Infof("getFromNeighbor: found %s/%s at %s", bucket, objname, neighsi.DaemonID)
+		glog.Infof("Found %s at %s", lom, neighsi)
 	}
 
-	geturl := fmt.Sprintf("%s%s?%s=%t", neighsi.PublicNet.DirectURL, r.URL.Path, cmn.URLParamLocal, islocal)
+	geturl := fmt.Sprintf("%s%s?%s=%t", neighsi.PublicNet.DirectURL, r.URL.Path, cmn.URLParamLocal, lom.Bislocal)
 	//
 	// http request
 	//
 	newr, err := http.NewRequest(http.MethodGet, geturl, nil)
 	if err != nil {
-		glog.Errorf("Unexpected failure to create %s request %s, err: %v", http.MethodGet, geturl, err)
+		errstr = fmt.Sprintf("Unexpected failure to create %s request %s, err: %v", http.MethodGet, geturl, err)
 		return
 	}
 	// Do
-	contextwith, cancel := context.WithTimeout(context.Background(), ctx.config.Timeout.SendFile)
+	contextwith, cancel := context.WithTimeout(context.Background(), cmn.GCO.Get().Timeout.SendFile)
 	defer cancel()
 	newrequest := newr.WithContext(contextwith)
 
 	response, err := t.httpclientLongTimeout.Do(newrequest)
 	if err != nil {
-		glog.Errorf("Failed to GET redirect URL %q, err: %v", geturl, err)
+		errstr = fmt.Sprintf("Failed to GET redirect URL %q, err: %v", geturl, err)
 		return
 	}
 	var (
-		nhobj   cksumvalue
-		errstr  string
-		size    int64
 		hval    = response.Header.Get(cmn.HeaderDFCChecksumVal)
 		htype   = response.Header.Get(cmn.HeaderDFCChecksumType)
-		hdhobj  = newcksumvalue(htype, hval)
+		hksum   = cmn.NewCksum(htype, hval)
 		version = response.Header.Get(cmn.HeaderDFCObjVersion)
+		getfqn  = fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfileRemote)
 	)
-	fqn, errstr := cluster.FQN(bucket, objname, islocal)
-	if errstr != "" {
+	props = &cluster.LOM{}
+	*props = *lom
+	props.Nhobj = hksum
+	props.Version = version
+	if _, lom.Nhobj, lom.Size, errstr = t.receive(getfqn, props, "", response.Body); errstr != "" {
 		response.Body.Close()
-		glog.Error(errstr)
-		return
-	}
-	getfqn := cluster.GenContentFQN(fqn, cluster.DefaultWorkfileType)
-	if _, nhobj, size, errstr = t.receive(getfqn, objname, "", hdhobj, response.Body); errstr != "" {
-		response.Body.Close()
-		glog.Errorf(errstr)
 		return
 	}
 	response.Body.Close()
-	if nhobj != nil {
-		nhtype, nhval := nhobj.get()
-		cmn.Assert(hdhobj == nil || htype == nhtype)
-		if hval != "" && nhval != "" && hval != nhval {
-			glog.Errorf("Bad checksum: %s/%s %s %.8s... != %.8s...", bucket, objname, htype, hval, nhval)
-			return
-		}
-	}
 	// commit
-	if err = os.Rename(getfqn, fqn); err != nil {
-		glog.Errorf("Failed to rename %s => %s, err: %v", getfqn, fqn, err)
+	if err = cmn.MvFile(getfqn, props.Fqn); err != nil {
+		glog.Errorln(err)
 		return
 	}
-	props = &objectProps{version: version, size: size, nhobj: nhobj}
-	if errstr = t.finalizeobj(fqn, bucket, props); errstr != "" {
-		glog.Errorf("finalizeobj %s/%s: %s (%+v)", bucket, objname, errstr, props)
-		props = nil
+	if errstr = props.Persist(); errstr != "" {
 		return
 	}
 	if glog.V(4) {
-		glog.Infof("getFromNeighbor: got %s/%s from %s, size %d, cksum %+v", bucket, objname, neighsi.DaemonID, size, nhobj)
+		glog.Infof("Success: %s (%s, %s) from %s", lom, cmn.B2S(lom.Size, 1), lom.Nhobj, neighsi)
 	}
 	return
 }
 
-func (t *targetrunner) coldget(ct context.Context, bucket, objname string, prefetch bool) (props *objectProps, errstr string, errcode int) {
+// FIXME: when called with a bad checksum will recompute yet again (optimize)
+func (t *targetrunner) getCold(ct context.Context, lom *cluster.LOM, prefetch bool) (errstr string, errcode int) {
 	var (
-		bucketmd    = t.bmdowner.get()
-		islocal     = bucketmd.islocal(bucket)
-		uname       = cluster.Uname(bucket, objname)
-		versioncfg  = &ctx.config.Ver
-		cksumcfg    = &ctx.config.Cksum
-		errv        string
-		nextTierURL string
-		vchanged    bool
-		inNextTier  bool
-		bucketProps cmn.BucketProps
-		err         error
+		config          = cmn.GCO.Get()
+		versioncfg      = &config.Ver
+		errv            string
+		vchanged, crace bool
+		err             error
+		props           *cluster.LOM
 	)
-	fqn, errstr := cluster.FQN(bucket, objname, islocal)
-	if errstr != "" {
-		return nil, errstr, http.StatusBadRequest
-	}
-	getfqn := cluster.GenContentFQN(fqn, cluster.DefaultWorkfileType)
-	// one cold GET at a time
 	if prefetch {
-		if !t.rtnamemap.TryLock(uname, true) {
-			glog.Infof("PREFETCH: cold GET race: %s/%s - skipping", bucket, objname)
-			return nil, "skip", 0
+		if !t.rtnamemap.TryLock(lom.Uname, true) {
+			glog.Infof("prefetch: cold GET race: %s - skipping", lom)
+			return "skip", 0
 		}
 	} else {
-		t.rtnamemap.Lock(uname, true)
+		t.rtnamemap.Lock(lom.Uname, true) // one cold-GET at a time
 	}
 
-	// check if bucket-level checksumming configuration should override cluster-level configuration
-	bucketProps, _, defined := bucketmd.propsAndChecksum(bucket)
-	if defined {
-		cksumcfg = &bucketProps.CksumConfig
+	// refill
+	if errstr = lom.Fill(cluster.LomFstat | cluster.LomCksum | cluster.LomVersion); errstr != "" {
+		glog.Warning(errstr)
+		lom.Doesnotexist = true // NOTE: in an attempt to fix it
 	}
 
 	// existence, access & versioning
-	coldget, size, version, eexists := t.lookupLocally(bucket, objname, fqn)
-	if !coldget && eexists == "" && !islocal {
-		if versioncfg.ValidateWarmGet && version != "" && t.versioningConfigured(bucket) {
-			vchanged, errv, _ = t.checkCloudVersion(ct, bucket, objname, version)
+	coldget := lom.Doesnotexist
+	if !coldget {
+		if versioncfg.ValidateWarmGet && lom.Version != "" && versioningConfigured(lom.Bislocal) {
+			vchanged, errv, _ = t.checkCloudVersion(ct, lom.Bucket, lom.Objname, lom.Version)
 			if errv == "" {
 				coldget = vchanged
 			}
 		}
-
-		if !coldget && cksumcfg.ValidateWarmGet && cksumcfg.Checksum != cmn.ChecksumNone {
-			validChecksum, errstr := t.validateObjectChecksum(fqn, cksumcfg.Checksum, size)
-			if errstr == "" {
-				coldget = !validChecksum
+		if !coldget && lom.Cksumcfg.ValidateWarmGet {
+			errstr := lom.Fill(cluster.LomCksum | cluster.LomCksumPresentRecomp | cluster.LomCksumMissingRecomp)
+			if lom.Badchecksum {
+				coldget = true
+			} else if errstr == "" {
+				if lom.Nhobj == nil {
+					coldget = true
+				}
 			} else {
-				glog.Warningf("Failed while validating checksum. Error: [%s]", errstr)
+				glog.Warningf("Failed to validate checksum, err: %s", errstr)
 			}
 		}
 	}
-	if !coldget && eexists == "" {
-		props = &objectProps{version: version, size: size}
-		xxHashBinary, _ := Getxattr(fqn, cmn.XattrXXHashVal)
-		if xxHashBinary != nil {
-			props.nhobj = newcksumvalue(cksumcfg.Checksum, string(xxHashBinary))
-		}
-		glog.Infof("cold GET race: %s/%s, size=%d, version=%s - nothing to do", bucket, objname, size, version)
+	getfqn := fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfileColdget)
+	if !coldget {
+		_ = lom.Fill(cluster.LomCksum)
+		glog.Infof("cold-GET race: %s(%s, ver=%s) - nothing to do", lom, cmn.B2S(lom.Size, 1), lom.Version)
+		crace = true
 		goto ret
 	}
-	// cold
-	nextTierURL = bucketProps.NextTierURL
-	if nextTierURL != "" && bucketProps.ReadPolicy == cmn.RWPolicyNextTier {
-		if inNextTier, errstr, errcode = t.objectInNextTier(nextTierURL, bucket, objname); errstr != "" {
-			t.rtnamemap.Unlock(uname, true)
-			return
+	//
+	// next tier if
+	//
+	if lom.Bprops != nil && lom.Bprops.NextTierURL != "" && lom.Bprops.ReadPolicy == cmn.RWPolicyNextTier {
+		var inNextTier bool
+		if inNextTier, errstr, errcode = t.objectInNextTier(lom.Bprops.NextTierURL, lom.Bucket, lom.Objname); errstr == "" {
+			if inNextTier {
+				if props, errstr, errcode =
+					t.getObjectNextTier(lom.Bprops.NextTierURL, lom.Bucket, lom.Objname, getfqn); errstr == "" {
+					coldget = false
+				}
+			}
 		}
 	}
-	if inNextTier {
-		if props, errstr, errcode = t.getObjectNextTier(nextTierURL, bucket, objname, getfqn); errstr != "" {
-			glog.Errorf("Error getting object from next tier after successful lookup, err: %s, HTTP "+
-				"status code: %d", errstr, errcode)
-		}
-	}
-	if !inNextTier || (inNextTier && errstr != "") {
-		if props, errstr, errcode = getcloudif().getobj(ct, getfqn, bucket, objname); errstr != "" {
-			t.rtnamemap.Unlock(uname, true)
+	//
+	// cloud
+	//
+	if coldget {
+		if props, errstr, errcode = getcloudif().getobj(ct, getfqn, lom.Bucket, lom.Objname); errstr != "" {
+			t.rtnamemap.Unlock(lom.Uname, true)
 			return
 		}
 	}
 	defer func() {
 		if errstr != "" {
-			t.rtnamemap.Unlock(uname, true)
+			t.rtnamemap.Unlock(lom.Uname, true)
 			if errRemove := os.Remove(getfqn); errRemove != nil {
 				glog.Errorf("Nested error %s => (remove %s => err: %v)", errstr, getfqn, errRemove)
 				t.fshc(errRemove, getfqn)
 			}
 		}
 	}()
-	if err = os.Rename(getfqn, fqn); err != nil {
-		errstr = fmt.Sprintf("Unexpected failure to rename %s => %s, err: %v", getfqn, fqn, err)
-		t.fshc(err, fqn)
+	if err = cmn.MvFile(getfqn, lom.Fqn); err != nil {
+		errstr = fmt.Sprintf("Unexpected failure to rename %s => %s, err: %v", getfqn, lom.Fqn, err)
+		t.fshc(err, lom.Fqn)
 		return
 	}
-	if errstr = t.finalizeobj(fqn, bucket, props); errstr != "" {
+	lom.RestoredReceived(props)
+	if errstr = lom.Persist(); errstr != "" {
 		return
 	}
 ret:
@@ -1548,54 +1618,31 @@ ret:
 	// NOTE: GET - downgrade and keep the lock, PREFETCH - unlock
 	//
 	if prefetch {
-		t.rtnamemap.Unlock(uname, true)
+		t.rtnamemap.Unlock(lom.Uname, true)
 	} else {
 		if vchanged {
-			t.statsif.addMany(namedVal64{statGetColdCount, 1}, namedVal64{statGetColdSize, props.size},
-				namedVal64{statVerChangeSize, props.size}, namedVal64{statVerChangeCount, 1})
-		} else {
-			t.statsif.addMany(namedVal64{statGetColdCount, 1}, namedVal64{statGetColdSize, props.size})
+			t.statsif.AddMany(stats.NamedVal64{stats.GetColdCount, 1},
+				stats.NamedVal64{stats.GetColdSize, lom.Size},
+				stats.NamedVal64{stats.VerChangeSize, lom.Size},
+				stats.NamedVal64{stats.VerChangeCount, 1})
+		} else if !crace {
+			t.statsif.AddMany(stats.NamedVal64{stats.GetColdCount, 1}, stats.NamedVal64{stats.GetColdSize, lom.Size})
 		}
-		t.rtnamemap.DowngradeLock(uname)
-	}
-	return
-}
-
-func (t *targetrunner) lookupLocally(bucket, objname, fqn string) (coldget bool, size int64, version, errstr string) {
-	if dryRun.disk {
-		return false, dryRun.size, "1", ""
-	}
-
-	finfo, err := os.Stat(fqn)
-	if err != nil {
-		switch {
-		case os.IsNotExist(err):
-			errstr = fmt.Sprintf("GET local: %s (%s/%s) %s", fqn, bucket, objname, doesnotexist)
-			coldget = true
-			return
-		case os.IsPermission(err):
-			errstr = fmt.Sprintf("Permission denied: access forbidden to %s", fqn)
-		default:
-			errstr = fmt.Sprintf("Failed to fstat %s, err: %v", fqn, err)
-			t.fshc(err, fqn)
-		}
-		return
-	}
-	size = finfo.Size()
-	if bytes, errs := Getxattr(fqn, cmn.XattrObjVersion); errs == "" {
-		version = string(bytes)
+		t.rtnamemap.DowngradeLock(lom.Uname)
 	}
 	return
 }
 
 func (t *targetrunner) lookupRemotely(bucket, objname string) *cluster.Snode {
-	res := t.broadcastNeighbors(
+	res := t.broadcastTo(
 		cmn.URLPath(cmn.Version, cmn.Objects, bucket, objname),
 		nil, // query
 		http.MethodHead,
 		nil,
 		t.smapowner.get(),
-		ctx.config.Timeout.MaxKeepalive,
+		cmn.GCO.Get().Timeout.MaxKeepalive,
+		cmn.NetworkIntraControl,
+		cluster.Targets,
 	)
 
 	for r := range res {
@@ -1628,8 +1675,8 @@ func (t *targetrunner) prepareLocalObjectList(bucket string, msg *cmn.GetMsg) (*
 		err        error
 	}
 
-	availablePaths, _ := fs.Mountpaths.Mountpaths()
-	ch := make(chan *mresp, len(availablePaths))
+	availablePaths, _ := fs.Mountpaths.Get()
+	ch := make(chan *mresp, len(fs.CSM.RegisteredContentTypes)*len(availablePaths))
 	wg := &sync.WaitGroup{}
 
 	// function to traverse one mountpoint
@@ -1658,17 +1705,22 @@ func (t *targetrunner) prepareLocalObjectList(bucket string, msg *cmn.GetMsg) (*
 	// If any mountpoint traversing fails others keep running until they complete.
 	// But in this case all collected data is thrown away because the partial result
 	// makes paging inconsistent
-	islocal := t.bmdowner.get().islocal(bucket)
-	for _, mpathInfo := range availablePaths {
-		wg.Add(1)
-		var localDir string
-		if islocal {
-			localDir = filepath.Join(fs.Mountpaths.MakePathLocal(mpathInfo.Path), bucket)
-		} else {
-			localDir = filepath.Join(fs.Mountpaths.MakePathCloud(mpathInfo.Path), bucket)
+	islocal := t.bmdowner.get().IsLocal(bucket)
+	for contentType, contentResolver := range fs.CSM.RegisteredContentTypes {
+		if !contentResolver.PermToProcess() {
+			continue
 		}
+		for _, mpathInfo := range availablePaths {
+			wg.Add(1)
+			var localDir string
+			if islocal {
+				localDir = filepath.Join(fs.Mountpaths.MakePathLocal(mpathInfo.Path, contentType), bucket)
+			} else {
+				localDir = filepath.Join(fs.Mountpaths.MakePathCloud(mpathInfo.Path, contentType), bucket)
+			}
 
-		go walkMpath(localDir)
+			go walkMpath(localDir)
+		}
 	}
 	wg.Wait()
 	close(ch)
@@ -1735,11 +1787,7 @@ func (t *targetrunner) getbucketnames(w http.ResponseWriter, r *http.Request) {
 	if !localonly {
 		buckets, errstr, errcode := getcloudif().getbucketnames(t.contextWithAuth(r))
 		if errstr != "" {
-			if errcode == 0 {
-				t.invalmsghdlr(w, r, errstr)
-			} else {
-				t.invalmsghdlr(w, r, errstr, errcode)
-			}
+			t.invalmsghdlr(w, r, errstr, errcode)
 			return
 		}
 		bucketnames.Cloud = buckets
@@ -1778,8 +1826,8 @@ func (t *targetrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket
 		glog.Infof("%s %s <= %s", r.Method, bucket, pid)
 	}
 	bucketmd := t.bmdowner.get()
-	islocal := bucketmd.islocal(bucket)
-	errstr, errcode = t.checkIsLocal(bucket, bucketmd, query, islocal)
+	islocal := bucketmd.IsLocal(bucket)
+	errstr, errcode = t.IsBucketLocal(bucket, &bucketmd.BMD, query, islocal)
 	if errstr != "" {
 		t.invalmsghdlr(w, r, errstr, errcode)
 		return
@@ -1790,7 +1838,7 @@ func (t *targetrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket
 		return
 	}
 
-	getMsgJson, err := jsoniter.Marshal(actionMsg.Value)
+	getMsgJSON, err := jsoniter.Marshal(actionMsg.Value)
 	if err != nil {
 		errstr := fmt.Sprintf("Unable to marshal 'value' in request: %v", actionMsg.Value)
 		t.invalmsghdlr(w, r, errstr)
@@ -1798,7 +1846,7 @@ func (t *targetrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket
 	}
 
 	var msg cmn.GetMsg
-	err = jsoniter.Unmarshal(getMsgJson, &msg)
+	err = jsoniter.Unmarshal(getMsgJSON, &msg)
 	if err != nil {
 		errstr := fmt.Sprintf("Unable to unmarshal 'value' in request to a cmn.GetMsg: %v", actionMsg.Value)
 		t.invalmsghdlr(w, r, errstr)
@@ -1820,11 +1868,7 @@ func (t *targetrunner) listbucket(w http.ResponseWriter, r *http.Request, bucket
 		jsbytes, errstr, errcode = getcloudif().listbucket(t.contextWithAuth(r), bucket, &msg)
 	}
 	if errstr != "" {
-		if errcode == 0 {
-			t.invalmsghdlr(w, r, errstr)
-		} else {
-			t.invalmsghdlr(w, r, errstr, errcode)
-		}
+		t.invalmsghdlr(w, r, errstr, errcode)
 		return
 	}
 	ok = t.writeJSON(w, r, jsbytes, "listbucket")
@@ -1857,7 +1901,7 @@ func (t *targetrunner) newFileWalk(bucket string, msg *cmn.GetMsg) *allfinfos {
 		needChkSum:   strings.Contains(msg.GetProps, cmn.GetPropsChecksum),
 		needVersion:  strings.Contains(msg.GetProps, cmn.GetPropsVersion),
 		needStatus:   strings.Contains(msg.GetProps, cmn.GetPropsStatus),
-		atimeRespCh:  make(chan *atimeResponse, 1),
+		atimeRespCh:  make(chan *atime.Response, 1),
 	}
 
 	if msg.GetPageSize != 0 {
@@ -1896,8 +1940,8 @@ func (ci *allfinfos) processDir(fqn string) error {
 //  - its name starts with prefix (if prefix is set)
 //  - it has not been already returned by previous page request
 //  - this target responses getobj request for the object
-func (ci *allfinfos) processRegularFile(fqn string, osfi os.FileInfo, objStatus string) error {
-	relname := fqn[ci.rootLength:]
+func (ci *allfinfos) processRegularFile(lom *cluster.LOM, osfi os.FileInfo, objStatus string) error {
+	relname := lom.Fqn[ci.rootLength:]
 	if ci.prefix != "" && !strings.HasPrefix(relname, ci.prefix) {
 		return nil
 	}
@@ -1915,16 +1959,8 @@ func (ci *allfinfos) processRegularFile(fqn string, osfi os.FileInfo, objStatus 
 		Status:   objStatus,
 	}
 	if ci.needAtime {
-		atimeResponse := <-getatimerunner().atime(fqn, ci.atimeRespCh)
-		atime, ok := atimeResponse.accessTime, atimeResponse.ok
-		if !ok {
-			atime, _, _ = getAmTimes(osfi)
-		}
-		if ci.msg.GetTimeFormat == "" {
-			fileInfo.Atime = atime.Format(cmn.RFC822)
-		} else {
-			fileInfo.Atime = atime.Format(ci.msg.GetTimeFormat)
-		}
+		lom.Fill(cluster.LomAtime)
+		fileInfo.Atime = lom.Atimestr
 	}
 	if ci.needCtime {
 		t := osfi.ModTime()
@@ -1938,20 +1974,21 @@ func (ci *allfinfos) processRegularFile(fqn string, osfi os.FileInfo, objStatus 
 		}
 	}
 	if ci.needChkSum {
-		xxHashBinary, errstr := Getxattr(fqn, cmn.XattrXXHashVal)
-		if errstr == "" {
-			fileInfo.Checksum = hex.EncodeToString(xxHashBinary)
+		errstr := lom.Fill(cluster.LomCksum)
+		if errstr == "" && lom.Nhobj != nil {
+			_, storedCksum := lom.Nhobj.Get()
+			fileInfo.Checksum = hex.EncodeToString([]byte(storedCksum))
 		}
 	}
 	if ci.needVersion {
-		version, errstr := Getxattr(fqn, cmn.XattrObjVersion)
+		errstr := lom.Fill(cluster.LomVersion)
 		if errstr == "" {
-			fileInfo.Version = string(version)
+			fileInfo.Version = lom.Version
 		}
 	}
 	fileInfo.Size = osfi.Size()
 	ci.files = append(ci.files, fileInfo)
-	ci.lastFilePath = fqn
+	ci.lastFilePath = lom.Fqn
 	return nil
 }
 
@@ -1969,25 +2006,24 @@ func (ci *allfinfos) listwalkf(fqn string, osfi os.FileInfo, err error) error {
 	if osfi.IsDir() {
 		return ci.processDir(fqn)
 	}
-	if spec, _ := cluster.FileSpec(fqn); spec != nil && !spec.PermToProcess() {
-		return nil
-	}
-
-	objStatus := cmn.ObjStatusOK
-	if ci.needStatus {
-		bucket, objname, err := ci.t.fqn2bckobj(fqn)
-		if err != nil {
-			glog.Warning(err)
+	// FIXME: check the logic vs local/global rebalance
+	var (
+		objStatus = cmn.ObjStatusOK
+		lom       = &cluster.LOM{T: ci.t, Fqn: fqn}
+	)
+	errstr := lom.Fill(0)
+	if ci.needStatus || ci.needAtime {
+		if errstr != "" || lom.Misplaced {
+			glog.Warning(errstr)
 			objStatus = cmn.ObjStatusMoved
 		}
-		si, errstr := hrwTarget(bucket, objname, ci.t.smapowner.get())
+		si, errstr := hrwTarget(lom.Bucket, lom.Objname, ci.t.smapowner.get())
 		if errstr != "" || ci.t.si.DaemonID != si.DaemonID {
-			glog.Warningf("Rebalanced object: %s/%s: %s", bucket, objname, errstr)
+			glog.Warningf("%s appears to be misplaced: %s", lom, errstr)
 			objStatus = cmn.ObjStatusMoved
 		}
 	}
-
-	return ci.processRegularFile(fqn, osfi, objStatus)
+	return ci.processRegularFile(lom, osfi, objStatus)
 }
 
 // After putting a new version it updates xattr attributes for the object
@@ -1996,99 +2032,60 @@ func (ci *allfinfos) listwalkf(fqn string, osfi os.FileInfo, err error) error {
 // Cloud bucket:
 //  - if the Cloud returns a new version id then save it to xattr
 // In both case a new checksum is saved to xattrs
-func (t *targetrunner) doput(w http.ResponseWriter, r *http.Request, bucket, objname string) (errstr string, errcode int) {
+func (t *targetrunner) doPut(r *http.Request, bucket, objname string) (errstr string, errcode int) {
 	var (
-		file                       *os.File
-		err                        error
-		hdhobj, nhobj              cksumvalue
-		xxHashVal                  string
-		htype, hval, nhtype, nhval string
-		sgl                        *memsys.SGL
-		started                    time.Time
+		htype   = r.Header.Get(cmn.HeaderDFCChecksumType)
+		hval    = r.Header.Get(cmn.HeaderDFCChecksumVal)
+		hksum   = cmn.NewCksum(htype, hval)
+		started = time.Now()
 	)
-	started = time.Now()
-	islocal := t.bmdowner.get().islocal(bucket)
-	fqn, errstr := cluster.FQN(bucket, objname, islocal)
-	if errstr != "" {
-		return errstr, http.StatusBadRequest
+	lom := &cluster.LOM{T: t, Bucket: bucket, Objname: objname}
+	if errstr = lom.Fill(cluster.LomFstat); errstr != "" {
+		return
 	}
-	putfqn := cluster.GenContentFQN(fqn, cluster.DefaultWorkfileType)
-	cksumcfg := &ctx.config.Cksum
-	if bucketProps, _, defined := t.bmdowner.get().propsAndChecksum(bucket); defined {
-		cksumcfg = &bucketProps.CksumConfig
-	}
-	hdhobj = newcksumvalue(r.Header.Get(cmn.HeaderDFCChecksumType), r.Header.Get(cmn.HeaderDFCChecksumVal))
+	putfqn := fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfilePut)
 
-	if hdhobj != nil {
-		htype, hval = hdhobj.get()
-	}
 	// optimize out if the checksums do match
-	if hdhobj != nil && cksumcfg.Checksum != cmn.ChecksumNone && !dryRun.disk && !dryRun.network {
-		file, err = os.Open(fqn)
-		// exists - compute checksum and compare with the caller's
-		if err == nil {
-			buf, slab := gmem2.AllocFromSlab2(0)
-			if htype == cmn.ChecksumXXHash {
-				xxHashVal, errstr = cmn.ComputeXXHash(file, buf)
-			} else {
-				errstr = fmt.Sprintf("Unsupported checksum type %s", htype)
-			}
-			// not a critical error
-			if errstr != "" {
-				glog.Warningf("Warning: Bad checksum: %s: %v", fqn, errstr)
-			}
-			slab.Free(buf)
-			// not a critical error
-			if err = file.Close(); err != nil {
-				glog.Warningf("Unexpected failure to close %s once xxhash-ed, err: %v", fqn, err)
-			}
-			if errstr == "" && xxHashVal == hval {
-				glog.Infof("Existing %s/%s is valid: PUT is a no-op", bucket, objname)
+	if lom.Exists() {
+		if errstr = lom.Fill(cluster.LomCksum); errstr == "" {
+			if cmn.EqCksum(lom.Nhobj, hksum) {
+				glog.Infof("Existing %s is valid: PUT is a no-op", lom)
 				return
 			}
 		}
 	}
-	if sgl, nhobj, _, errstr = t.receive(putfqn, objname, "", hdhobj, r.Body); errstr != "" {
-		return
-	}
-	if nhobj != nil {
-		nhtype, nhval = nhobj.get()
-		cmn.Assert(hdhobj == nil || htype == nhtype)
-	}
-	// validate checksum when and if provided
-	if hval != "" && nhval != "" && hval != nhval && !dryRun.disk && !dryRun.network {
-		errstr = fmt.Sprintf("Bad checksum: %s/%s %s %.8s... != %.8s...", bucket, objname, htype, hval, nhval)
+	lom.Nhobj = hksum
+	if _, lom.Nhobj, lom.Size, errstr = t.receive(putfqn, lom, "", r.Body); errstr != "" {
 		return
 	}
 	// commit
-	props := &objectProps{nhobj: nhobj}
-	if sgl == nil {
-		if !dryRun.disk && !dryRun.network {
-			errstr, errcode = t.putCommit(t.contextWithAuth(r), bucket, objname, putfqn, fqn, props, false /*rebalance*/)
-		}
-		if errstr == "" {
-			delta := time.Since(started)
-			t.statsif.addMany(namedVal64{statPutCount, 1}, namedVal64{statPutLatency, int64(delta)})
-			if glog.V(4) {
-				glog.Infof("PUT: %s/%s, %d µs", bucket, objname, int64(delta/time.Microsecond))
-			}
-		}
-		return
+	if !dryRun.disk && !dryRun.network {
+		errstr, errcode = t.putCommit(t.contextWithAuth(r), lom, putfqn, false /*rebalance*/)
 	}
-	// FIXME: use xaction
-	go t.sglToCloudAsync(t.contextWithAuth(r), sgl, bucket, objname, putfqn, fqn, props)
+	if errstr == "" {
+		delta := time.Since(started)
+		t.statsif.AddMany(stats.NamedVal64{stats.PutCount, 1}, stats.NamedVal64{stats.PutLatency, int64(delta)})
+		if glog.V(4) {
+			glog.Infof("PUT: %s/%s, %d µs", bucket, objname, int64(delta/time.Microsecond))
+		}
+
+		if false { // TODO: bucket n-way mirror props
+			xlr := t.xactions.renewPutLR(lom.Bucket, lom.Bislocal) // TODO: optimize find
+			xlr.Copy(lom)
+		}
+	}
 	return
 }
 
-func (t *targetrunner) doReplicationPut(w http.ResponseWriter, r *http.Request,
-	bucket, objname, replicaSrc string) (errstr string) {
+// TODO: this function is for now unused because replication does not work
+func (t *targetrunner) doReplicationPut(r *http.Request, bucket, objname, replicaSrc string) (errstr string) {
 
 	var (
 		started = time.Now()
-		islocal = t.bmdowner.get().islocal(bucket)
+		islocal = t.bmdowner.get().IsLocal(bucket)
 	)
 
-	fqn, errstr := cluster.FQN(bucket, objname, islocal)
+	fqn, errstr := cluster.FQN(fs.ObjectType, bucket, objname, islocal)
 	if errstr != "" {
 		return errstr
 	}
@@ -2099,141 +2096,60 @@ func (t *targetrunner) doReplicationPut(w http.ResponseWriter, r *http.Request,
 	}
 
 	delta := time.Since(started)
-	t.statsif.addMany(namedVal64{statReplPutCount, 1}, namedVal64{statReplPutLatency, int64(delta / time.Microsecond)})
+	t.statsif.AddMany(stats.NamedVal64{stats.ReplPutCount, 1}, stats.NamedVal64{stats.ReplPutLatency, int64(delta)})
 	if glog.V(4) {
 		glog.Infof("Replication PUT: %s/%s, %d µs", bucket, objname, int64(delta/time.Microsecond))
 	}
 	return ""
 }
 
-func (t *targetrunner) sglToCloudAsync(ct context.Context, sgl *memsys.SGL, bucket, objname, putfqn, fqn string, objprops *objectProps) {
-	slab := sgl.Slab()
-	buf := slab.Alloc()
-	defer func() {
-		sgl.Free()
-		slab.Free(buf)
-	}()
-	// sgl => fqn sequence
-	file, err := cmn.CreateFile(putfqn)
-	if err != nil {
-		t.fshc(err, putfqn)
-		glog.Errorln("sglToCloudAsync: create", putfqn, err)
-		return
-	}
-	reader := memsys.NewReader(sgl)
-	written, err := io.CopyBuffer(file, reader, buf)
-	if err != nil {
-		t.fshc(err, putfqn)
-		glog.Errorln("sglToCloudAsync: CopyBuffer", err)
-		if err1 := file.Close(); err1 != nil {
-			glog.Errorf("Nested error %v => (remove %s => err: %v)", err, putfqn, err1)
-		}
-		if err2 := os.Remove(putfqn); err2 != nil {
-			glog.Errorf("Nested error %v => (remove %s => err: %v)", err, putfqn, err2)
-		}
-		return
-	}
-	cmn.Assert(written == sgl.Size())
-	err = file.Close()
-	if err != nil {
-		glog.Errorln("sglToCloudAsync: Close", err)
-		if err1 := os.Remove(putfqn); err1 != nil {
-			glog.Errorf("Nested error %v => (remove %s => err: %v)", err, putfqn, err1)
-		}
-		return
-	}
-	errstr, _ := t.putCommit(ct, bucket, objname, putfqn, fqn, objprops, false /*rebalance*/)
-	if errstr != "" {
-		glog.Errorln("sglToCloudAsync: commit", errstr)
-		return
-	}
-	glog.Infof("sglToCloudAsync: %s/%s", bucket, objname)
-}
-
-func (t *targetrunner) putCommit(ct context.Context, bucket, objname, putfqn, fqn string,
-	objprops *objectProps, rebalance bool) (errstr string, errcode int) {
-	var (
-		err     error
-		renamed bool
-	)
-	errstr, errcode, err, renamed = t.doPutCommit(ct, bucket, objname, putfqn, fqn, objprops, rebalance)
-	if errstr != "" && !os.IsNotExist(err) && !renamed {
-		t.fshc(err, putfqn)
-		if err = os.Remove(putfqn); err != nil {
-			glog.Errorf("Nested error: %s => (remove %s => err: %v)", errstr, putfqn, err)
+func (t *targetrunner) putCommit(ct context.Context, lom *cluster.LOM, putfqn string, rebalance bool) (errstr string, errcode int) {
+	var renamed bool
+	renamed, errstr, errcode = t.doPutCommit(ct, lom, putfqn, rebalance)
+	if errstr != "" && !renamed {
+		if _, err := os.Stat(putfqn); err == nil || !os.IsNotExist(err) {
+			t.fshc(err, putfqn)
+			if err = os.Remove(putfqn); err != nil {
+				glog.Errorf("Nested error: %s => (remove %s => err: %v)", errstr, putfqn, err)
+			}
 		}
 	}
 	return
 }
 
-func (t *targetrunner) doPutCommit(ct context.Context, bucket, objname, putfqn, fqn string,
-	objprops *objectProps, rebalance bool) (errstr string, errcode int, err error, renamed bool) {
-	var (
-		file     *os.File
-		bucketmd = t.bmdowner.get()
-		islocal  = bucketmd.islocal(bucket)
-	)
-	reopenFile := func() (io.ReadCloser, error) {
-		return os.Open(putfqn)
-	}
-
-	if !islocal && !rebalance {
-		if file, err = os.Open(putfqn); err != nil {
-			errstr = fmt.Sprintf("Failed to reopen %s err: %v", putfqn, err)
+func (t *targetrunner) doPutCommit(ct context.Context, lom *cluster.LOM, putfqn string,
+	rebalance bool) (renamed bool, errstr string, errcode int) {
+	if !lom.Bislocal && !rebalance {
+		if file, err := os.Open(putfqn); err != nil {
+			errstr = fmt.Sprintf("Failed to open %s err: %v", putfqn, err)
 			return
-		}
-		_, p := bucketmd.get(bucket, islocal)
-		if p.NextTierURL != "" && p.WritePolicy == cmn.RWPolicyNextTier {
-			if errstr, errcode = t.putObjectNextTier(p.NextTierURL, bucket, objname, file, reopenFile); errstr != "" {
-				glog.Errorf("Error putting bucket/object: %s/%s to next tier, err: %s, HTTP status code: %d",
-					bucket, objname, errstr, errcode)
-				file, err = os.Open(putfqn)
-				if err != nil {
-					errstr = fmt.Sprintf("Failed to reopen %s err: %v", putfqn, err)
-				} else {
-					objprops.version, errstr, errcode = getcloudif().putobj(ct, file, bucket, objname, objprops.nhobj)
-				}
-			}
 		} else {
-			objprops.version, errstr, errcode = getcloudif().putobj(ct, file, bucket, objname, objprops.nhobj)
-		}
-	} else if islocal {
-		if t.versioningConfigured(bucket) {
-			if objprops.version, errstr = t.increaseObjectVersion(fqn); errstr != "" {
+			lom.Version, errstr, errcode = getcloudif().putobj(ct, file, lom.Bucket, lom.Objname, lom.Nhobj)
+			file.Close()
+			if errstr != "" {
 				return
 			}
 		}
-		_, p := bucketmd.get(bucket, islocal)
-		if p.NextTierURL != "" {
-			if file, err = os.Open(putfqn); err != nil {
-				errstr = fmt.Sprintf("Failed to reopen %s err: %v", putfqn, err)
-			} else if errstr, errcode = t.putObjectNextTier(p.NextTierURL, bucket, objname, file, reopenFile); errstr != "" {
-				glog.Errorf("Error putting bucket/object: %s/%s to next tier, err: %s, HTTP status code: %d",
-					bucket, objname, errstr, errcode)
-			}
+	}
+	// when all set and done:
+	t.rtnamemap.Lock(lom.Uname, true)
+
+	if lom.Bislocal && versioningConfigured(true) {
+		if lom.Version, errstr = lom.IncObjectVersion(); errstr != "" {
+			t.rtnamemap.Unlock(lom.Uname, true)
+			return
 		}
 	}
-	file.Close()
-	if errstr != "" {
-		return
-	}
-
-	// when all set and done:
-	uname := cluster.Uname(bucket, objname)
-	t.rtnamemap.Lock(uname, true)
-
-	if err = os.Rename(putfqn, fqn); err != nil {
-		t.rtnamemap.Unlock(uname, true)
-		errstr = fmt.Sprintf("Failed to rename %s => %s, err: %v", putfqn, fqn, err)
+	if err := cmn.MvFile(putfqn, lom.Fqn); err != nil {
+		t.rtnamemap.Unlock(lom.Uname, true)
+		errstr = fmt.Sprintf("work => %s: %v", lom, err)
 		return
 	}
 	renamed = true
-	if errstr = t.finalizeobj(fqn, bucket, objprops); errstr != "" {
-		t.rtnamemap.Unlock(uname, true)
-		glog.Errorf("finalizeobj %s/%s: %s (%+v)", bucket, objname, errstr, objprops)
-		return
+	if errstr = lom.Persist(); errstr != "" {
+		glog.Errorf("Failed to persist %s: %s", lom, errstr)
 	}
-	t.rtnamemap.Unlock(uname, true)
+	t.rtnamemap.Unlock(lom.Uname, true)
 	return
 }
 
@@ -2243,79 +2159,77 @@ func (t *targetrunner) dorebalance(r *http.Request, from, to, bucket, objname st
 			t.si.DaemonID, from, to)
 		return
 	}
-	var size int64
-	bucketmd := t.bmdowner.get()
-	fqn, errstr := cluster.FQN(bucket, objname, bucketmd.islocal(bucket))
-	if errstr != "" {
+	var (
+		putfqn string
+		lom    = &cluster.LOM{T: t, Bucket: bucket, Objname: objname}
+	)
+	if errstr = lom.Fill(0); errstr != "" {
 		return
 	}
-	ver := bucketmd.version()
 	if t.si.DaemonID == from {
 		//
 		// the source
 		//
-		uname := cluster.Uname(bucket, objname)
-		t.rtnamemap.Lock(uname, false)
-		defer t.rtnamemap.Unlock(uname, false)
+		t.rtnamemap.Lock(lom.Uname, false)
+		defer t.rtnamemap.Unlock(lom.Uname, false)
 
-		finfo, err := os.Stat(fqn)
-		if glog.V(3) {
-			glog.Infof("Rebalance %s/%s from %s (self) to %s", bucket, objname, from, to)
-		}
-		if err != nil && os.IsNotExist(err) {
-			errstr = fmt.Sprintf("File copy: %s %s at the source %s", fqn, doesnotexist, t.si.DaemonID)
+		if errstr = lom.Fill(cluster.LomFstat); errstr != "" {
 			return
+		}
+		if lom.Doesnotexist {
+			errstr = fmt.Sprintf("Rebalance: %s at the source %s", lom, t.si)
+			return
+		}
+		if glog.V(3) {
+			glog.Infof("Rebalancing %s from %s(self) to %s", lom, from, to)
 		}
 		si := t.smapowner.get().GetTarget(to)
 		if si == nil {
-			errstr = fmt.Sprintf("File copy: unknown destination %s (Smap not in-sync?)", to)
+			errstr = fmt.Sprintf("Unknown destination %s (Smap not in-sync?)", to)
 			return
 		}
-		size = finfo.Size()
-		if errstr = t.sendfile(r.Method, bucket, objname, si, size, "", ""); errstr != "" {
+		if errstr = t.sendfile(r.Method, bucket, objname, si, lom.Size, "", "", nil); errstr != "" {
 			return
 		}
 		if glog.V(4) {
-			glog.Infof("Rebalance %s/%s done, %.2f MB", bucket, objname, float64(size)/cmn.MiB)
+			glog.Infof("Rebalance %s(%s) done", lom, cmn.B2S(lom.Size, 1))
 		}
 	} else {
 		//
 		// the destination
 		//
 		if glog.V(4) {
-			glog.Infof("Rebalance %s/%s from %s to %s (self, %s, ver %d)", bucket, objname, from, to, fqn, ver)
+			glog.Infof("Rebalance %s from %s to %s(self)", lom, from, to)
 		}
-		putfqn := cluster.GenContentFQN(fqn, cluster.DefaultWorkfileType)
-		_, err := os.Stat(fqn)
-		if err != nil && os.IsExist(err) {
-			glog.Infof("File copy: %s already exists at the destination %s", fqn, t.si.DaemonID)
-			return // not an error, nothing to do
-		}
-		var (
-			hdhobj = newcksumvalue(r.Header.Get(cmn.HeaderDFCChecksumType), r.Header.Get(cmn.HeaderDFCChecksumVal))
-			props  = &objectProps{version: r.Header.Get(cmn.HeaderDFCObjVersion)}
-		)
-		if timeStr := r.Header.Get(cmn.HeaderDFCObjAtime); timeStr != "" {
-			if tm, err := time.Parse(time.RFC822, timeStr); err == nil {
-				props.atime = tm
-			}
-		}
-		if _, props.nhobj, size, errstr = t.receive(putfqn, objname, "", hdhobj, r.Body); errstr != "" {
+		if errstr = lom.Fill(cluster.LomFstat); errstr != "" {
 			return
 		}
-		if props.nhobj != nil {
-			nhtype, nhval := props.nhobj.get()
-			htype, hval := hdhobj.get()
-			cmn.Assert(htype == nhtype)
-			if hval != nhval {
-				errstr = fmt.Sprintf("Bad checksum at the destination %s: %s/%s %s %.8s... != %.8s...",
-					t.si.DaemonID, bucket, objname, htype, hval, nhval)
-				return
+		if lom.Exists() {
+			glog.Infof("%s already exists at the destination %s", lom, t.si)
+			return // not an error, nothing to do
+		}
+		putfqn = fs.CSM.GenContentParsedFQN(lom.ParsedFQN, fs.WorkfileType, fs.WorkfileRebalance)
+
+		var (
+			size  int64
+			htype = r.Header.Get(cmn.HeaderDFCChecksumType)
+			hval  = r.Header.Get(cmn.HeaderDFCChecksumVal)
+			hksum = cmn.NewCksum(htype, hval)
+		)
+		lom.Version = r.Header.Get(cmn.HeaderDFCObjVersion)
+		if timeStr := r.Header.Get(cmn.HeaderDFCObjAtime); timeStr != "" {
+			lom.Atimestr = timeStr
+			if tm, err := time.Parse(time.RFC822, timeStr); err == nil {
+				lom.Atime = tm
 			}
 		}
-		errstr, _ = t.putCommit(t.contextWithAuth(r), bucket, objname, putfqn, fqn, props, true /*rebalance*/)
+		lom.Nhobj = hksum
+		if _, lom.Nhobj, lom.Size, errstr = t.receive(putfqn, lom, "", r.Body); errstr != "" {
+			return
+		}
+		errstr, _ = t.putCommit(t.contextWithAuth(r), lom, putfqn, true /*rebalance*/)
 		if errstr == "" {
-			t.statsif.addMany(namedVal64{statRxCount, 1}, namedVal64{statRxSize, size})
+			t.statsif.AddMany(stats.NamedVal64{stats.RxCount, 1}, stats.NamedVal64{stats.RxSize, size})
 		}
 	}
 	return
@@ -2325,45 +2239,36 @@ func (t *targetrunner) fildelete(ct context.Context, bucket, objname string, evi
 	var (
 		errstr  string
 		errcode int
+		lom     = &cluster.LOM{T: t, Bucket: bucket, Objname: objname}
 	)
-	islocal := t.bmdowner.get().islocal(bucket)
-	fqn, errstr := cluster.FQN(bucket, objname, islocal)
-	if errstr != "" {
+	if errstr = lom.Fill(0); errstr != "" {
 		return errors.New(errstr)
 	}
-	uname := cluster.Uname(bucket, objname)
+	t.rtnamemap.Lock(lom.Uname, true)
+	defer t.rtnamemap.Unlock(lom.Uname, true)
 
-	t.rtnamemap.Lock(uname, true)
-	defer t.rtnamemap.Unlock(uname, true)
-
-	if !islocal && !evict {
+	if !lom.Bislocal && !evict {
 		if errstr, errcode = getcloudif().deleteobj(ct, bucket, objname); errstr != "" {
 			if errcode == 0 {
 				return fmt.Errorf("%s", errstr)
 			}
 			return fmt.Errorf("%d: %s", errcode, errstr)
 		}
-
-		t.statsif.add(statDeleteCount, 1)
+		t.statsif.Add(stats.DeleteCount, 1)
 	}
 
-	finfo, err := os.Stat(fqn)
-	if err != nil {
-		if os.IsNotExist(err) {
-			if islocal && !evict {
-				return fmt.Errorf("DELETE local: file %s (local bucket %s, object %s) %s", fqn, bucket, objname, doesnotexist)
-			}
-
-			// Do try to delete non-cached objects.
-			return nil
-		}
+	_ = lom.Fill(cluster.LomFstat) // ignore fstat errors
+	if lom.Doesnotexist {
+		return nil
 	}
-	if !(evict && islocal) {
+	if !(evict && lom.Bislocal) {
 		// Don't evict from a local bucket (this would be deletion)
-		if err := os.Remove(fqn); err != nil {
+		if err := os.Remove(lom.Fqn); err != nil {
 			return err
 		} else if evict {
-			t.statsif.addMany(namedVal64{statLruEvictCount, 1}, namedVal64{statLruEvictSize, finfo.Size()})
+			t.statsif.AddMany(
+				stats.NamedVal64{stats.LruEvictCount, 1},
+				stats.NamedVal64{stats.LruEvictSize, lom.Size})
 		}
 	}
 	return nil
@@ -2384,51 +2289,17 @@ func (t *targetrunner) renamefile(w http.ResponseWriter, r *http.Request, msg cm
 	uname := cluster.Uname(bucket, objname)
 	t.rtnamemap.Lock(uname, true)
 
-	if errstr = t.renameobject(bucket, objname, bucket, newobjname); errstr != "" {
+	if errstr = t.renameObject(fs.ObjectType, bucket, objname, bucket, newobjname); errstr != "" {
 		t.invalmsghdlr(w, r, errstr)
 	}
 	t.rtnamemap.Unlock(uname, true)
 }
 
 func (t *targetrunner) replicate(w http.ResponseWriter, r *http.Request, msg cmn.ActionMsg) {
-	apitems, err := t.checkRESTItems(w, r, 2, false, cmn.Version, cmn.Objects)
-	if err != nil {
-		return
-	}
-	bucket, object := apitems[0], apitems[1]
-	if !t.validatebckname(w, r, bucket) {
-		return
-	}
-	bucketmd := t.bmdowner.get()
-	islocal := bucketmd.islocal(bucket)
-	fqn, errstr := cluster.FQN(bucket, object, islocal)
-	if errstr != "" {
-		t.invalmsghdlr(w, r, errstr)
-		return
-	}
-	ok, props := bucketmd.get(bucket, islocal)
-	if !ok {
-		errstr = fmt.Sprintf("Failed to get bucket properties for bucket %q", bucket)
-	} else if props.NextTierURL == "" {
-		errstr = fmt.Sprintf("Bucket %q is not configured with next tier URL", bucket)
-	} else if props.CloudProvider != cmn.ProviderDFC {
-		errstr = fmt.Sprintf("Bucket %q is configured with invalid cloud provider: %q, expected provider: %q",
-			bucket, props.CloudProvider, cmn.ProviderDFC)
-	}
-	if errstr != "" {
-		t.invalmsghdlr(w, r, errstr)
-		return
-	}
-
-	rr := getreplicationrunner()
-	if err = rr.reqSendReplica(props.NextTierURL, fqn, false, replicationPolicySync); err != nil {
-		errstr = fmt.Sprintf("Failed to replicate bucket/object: %s/%s, error: %v", bucket, object, err)
-		t.invalmsghdlr(w, r, errstr)
-		return
-	}
+	t.invalmsghdlr(w, r, "not supported yet") // NOTE: daemon.go, proxy.go, config.sh, and tests/replication
 }
 
-func (t *targetrunner) renameobject(bucketFrom, objnameFrom, bucketTo, objnameTo string) (errstr string) {
+func (t *targetrunner) renameObject(contentType, bucketFrom, objnameFrom, bucketTo, objnameTo string) (errstr string) {
 	var (
 		si     *cluster.Snode
 		newfqn string
@@ -2437,8 +2308,8 @@ func (t *targetrunner) renameobject(bucketFrom, objnameFrom, bucketTo, objnameTo
 		return
 	}
 	bucketmd := t.bmdowner.get()
-	islocalFrom := bucketmd.islocal(bucketFrom)
-	fqn, errstr := cluster.FQN(bucketFrom, objnameFrom, islocalFrom)
+	islocalFrom := bucketmd.IsLocal(bucketFrom)
+	fqn, errstr := cluster.FQN(contentType, bucketFrom, objnameFrom, islocalFrom)
 	if errstr != "" {
 		return
 	}
@@ -2449,18 +2320,15 @@ func (t *targetrunner) renameobject(bucketFrom, objnameFrom, bucketTo, objnameTo
 	}
 	// local rename
 	if si.DaemonID == t.si.DaemonID {
-		islocalTo := bucketmd.islocal(bucketTo)
-		newfqn, errstr = cluster.FQN(bucketTo, objnameTo, islocalTo)
+		islocalTo := bucketmd.IsLocal(bucketTo)
+		newfqn, errstr = cluster.FQN(contentType, bucketTo, objnameTo, islocalTo)
 		if errstr != "" {
 			return
 		}
-		dirname := filepath.Dir(newfqn)
-		if err := cmn.CreateDir(dirname); err != nil {
-			errstr = fmt.Sprintf("Unexpected failure to create local dir %s, err: %v", dirname, err)
-		} else if err := os.Rename(fqn, newfqn); err != nil {
-			errstr = fmt.Sprintf("Failed to rename %s => %s, err: %v", fqn, newfqn, err)
+		if err := cmn.MvFile(fqn, newfqn); err != nil {
+			errstr = fmt.Sprintf("Rename object %s/%s: %v", bucketFrom, objnameFrom, err)
 		} else {
-			t.statsif.add(statRenameCount, 1)
+			t.statsif.Add(stats.RenameCount, 1)
 			if glog.V(3) {
 				glog.Infof("Renamed %s => %s", fqn, newfqn)
 			}
@@ -2468,108 +2336,63 @@ func (t *targetrunner) renameobject(bucketFrom, objnameFrom, bucketTo, objnameTo
 		return
 	}
 	// move/migrate
-	glog.Infof("Migrating %s/%s at %s => %s/%s at %s", bucketFrom, objnameFrom, t.si.DaemonID, bucketTo, objnameTo, si.DaemonID)
+	glog.Infof("Migrating %s/%s at %s => %s/%s at %s", bucketFrom, objnameFrom, t.si, bucketTo, objnameTo, si)
 
-	errstr = t.sendfile(http.MethodPut, bucketFrom, objnameFrom, si, finfo.Size(), bucketTo, objnameTo)
+	errstr = t.sendfile(http.MethodPut, bucketFrom, objnameFrom, si, finfo.Size(), bucketTo, objnameTo, nil)
 	return
 }
 
 // Rebalancing supports versioning. If an object in DFC cache has version in
 // xattrs then the sender adds to HTTP header object version. A receiver side
 // reads version from headers and set xattrs if the version is not empty
-func (t *targetrunner) sendfile(method, bucket, objname string, destsi *cluster.Snode, size int64, newbucket, newobjname string) string {
-	var (
-		xxHashVal string
-		errstr    string
-		version   []byte
-	)
-	if size == 0 {
-		glog.Warningf("Unexpected: %s/%s size is zero", bucket, objname)
-	}
+func (t *targetrunner) sendfile(method, bucket, objname string, destsi *cluster.Snode, size int64,
+	newbucket, newobjname string, atimeRespCh chan *atime.Response) string {
 	if newobjname == "" {
 		newobjname = objname
 	}
 	if newbucket == "" {
 		newbucket = bucket
 	}
-	fromid, toid := t.si.DaemonID, destsi.DaemonID // source=self and destination
-	url := destsi.PublicNet.DirectURL + cmn.URLPath(cmn.Version, cmn.Objects, newbucket, newobjname)
-	url += fmt.Sprintf("?%s=%s&%s=%s", cmn.URLParamFromID, fromid, cmn.URLParamToID, toid)
-	bucketmd := t.bmdowner.get()
-	islocal := bucketmd.islocal(bucket)
-	cksumcfg := &ctx.config.Cksum
-	if bucketProps, _, defined := bucketmd.propsAndChecksum(bucket); defined {
-		cksumcfg = &bucketProps.CksumConfig
-	}
-	fqn, errstr := cluster.FQN(bucket, objname, islocal)
+
+	lom := &cluster.LOM{T: t, Size: size, Bucket: bucket, Objname: objname, AtimeRespCh: atimeRespCh}
+	errstr := lom.Fill(cluster.LomFstat | cluster.LomVersion | cluster.LomAtime | cluster.LomCksum | cluster.LomCksumMissingRecomp)
 	if errstr != "" {
 		return errstr
 	}
-
-	var accessTime time.Time
-	var ok bool
-	if bucketmd.lruEnabled(bucket) {
-		atimeResponse := <-getatimerunner().atime(fqn)
-		accessTime, ok = atimeResponse.accessTime, atimeResponse.ok
+	if lom.Doesnotexist {
+		return lom.String()
 	}
-
-	// must read a file access before any operation: the next Open changes atime
-	accessTimeStr := ""
-	if ok {
-		accessTimeStr = accessTime.Format(cmn.RFC822)
-	} else {
-		fileInfo, err := os.Stat(fqn)
-		if err == nil {
-			atime, mtime, _ := getAmTimes(fileInfo)
-			if mtime.After(atime) {
-				atime = mtime
-			}
-			accessTimeStr = atime.Format(cmn.RFC822)
-		}
-	}
-
-	file, err := os.Open(fqn)
+	// TODO make sure this Open will have no atime "side-effect", here and elsewhere
+	file, err := os.Open(lom.Fqn) // FIXME: make sure Open has no atime "side-effect", here and elsewhere
 	if err != nil {
-		return fmt.Sprintf("Failed to open %q, err: %v", fqn, err)
+		return fmt.Sprintf("Failed to open %s(%q), err: %v", lom, lom.Fqn, err)
 	}
 	defer file.Close()
 
-	if version, errstr = Getxattr(fqn, cmn.XattrObjVersion); errstr != "" {
-		glog.Errorf("Failed to read %q xattr %s, err %s", fqn, cmn.XattrObjVersion, errstr)
-	}
-
-	if cksumcfg.Checksum != cmn.ChecksumNone {
-		cmn.Assert(cksumcfg.Checksum == cmn.ChecksumXXHash, "invalid checksum type: '"+cksumcfg.Checksum+"'")
-		buf, slab := gmem2.AllocFromSlab2(size)
-		if xxHashVal, errstr = cmn.ComputeXXHash(file, buf); errstr != "" {
-			slab.Free(buf)
-			return errstr
-		}
-		slab.Free(buf)
-		if _, err = file.Seek(0, 0); err != nil {
-			return fmt.Sprintf("Unexpected fseek failure when sending %q from %s, err: %v", fqn, t.si.DaemonID, err)
-		}
-	}
 	//
 	// http request
 	//
+	fromid, toid := t.si.DaemonID, destsi.DaemonID // source=self and destination
+	url := destsi.IntraDataNet.DirectURL + cmn.URLPath(cmn.Version, cmn.Objects, newbucket, newobjname)
+	url += fmt.Sprintf("?%s=%s&%s=%s", cmn.URLParamFromID, fromid, cmn.URLParamToID, toid)
 	request, err := http.NewRequest(method, url, file)
 	if err != nil {
 		return fmt.Sprintf("Unexpected failure to create %s request %s, err: %v", method, url, err)
 	}
-	if xxHashVal != "" {
-		request.Header.Set(cmn.HeaderDFCChecksumType, cmn.ChecksumXXHash)
-		request.Header.Set(cmn.HeaderDFCChecksumVal, xxHashVal)
+	if lom.Nhobj != nil {
+		htype, hval := lom.Nhobj.Get()
+		request.Header.Set(cmn.HeaderDFCChecksumType, htype)
+		request.Header.Set(cmn.HeaderDFCChecksumVal, hval)
 	}
-	if len(version) != 0 {
-		request.Header.Set(cmn.HeaderDFCObjVersion, string(version))
+	if lom.Version != "" {
+		request.Header.Set(cmn.HeaderDFCObjVersion, lom.Version)
 	}
-	if accessTimeStr != "" {
-		request.Header.Set(cmn.HeaderDFCObjAtime, accessTimeStr)
+	if lom.Atimestr != "" {
+		request.Header.Set(cmn.HeaderDFCObjAtime, lom.Atimestr)
 	}
 
 	// Do
-	contextwith, cancel := context.WithTimeout(context.Background(), ctx.config.Timeout.SendFile)
+	contextwith, cancel := context.WithTimeout(context.Background(), cmn.GCO.Get().Timeout.SendFile)
 	defer cancel()
 	newrequest := request.WithContext(contextwith)
 
@@ -2598,7 +2421,7 @@ func (t *targetrunner) sendfile(method, bucket, objname string, destsi *cluster.
 	}
 	response.Body.Close()
 	// stats
-	t.statsif.addMany(namedVal64{statTxCount, 1}, namedVal64{statTxSize, size})
+	t.statsif.AddMany(stats.NamedVal64{stats.TxCount, 1}, stats.NamedVal64{stats.TxSize, size})
 	return ""
 }
 
@@ -2613,7 +2436,7 @@ func (t *targetrunner) checkCacheQueryParameter(r *http.Request) (useCache bool,
 	return
 }
 
-func (t *targetrunner) checkIsLocal(bucket string, bucketmd *bucketMD, q url.Values, islocal bool) (errstr string, errcode int) {
+func (t *targetrunner) IsBucketLocal(bucket string, bmd *cluster.BMD, q url.Values, islocal bool) (errstr string, errcode int) {
 	proxylocalstr := q.Get(cmn.URLParamLocal)
 	if proxylocalstr == "" {
 		return
@@ -2627,19 +2450,19 @@ func (t *targetrunner) checkIsLocal(bucket string, bucketmd *bucketMD, q url.Val
 	if islocal == proxylocal {
 		return
 	}
-	errstr = fmt.Sprintf("islocalbucket(%s) mismatch: %t (proxy) != %t (target %s)", bucket, proxylocal, islocal, t.si.DaemonID)
+	errstr = fmt.Sprintf("%s: bucket %s is-local mismatch: (proxy) %t != %t (self)", t.si, bucket, proxylocal, islocal)
 	errcode = http.StatusInternalServerError
 	if s := q.Get(cmn.URLParamBMDVersion); s != "" {
 		if v, err := strconv.ParseInt(s, 0, 64); err != nil {
 			glog.Errorf("Unexpected: failed to convert %s to int, err: %v", s, err)
-		} else if v < bucketmd.version() {
-			glog.Errorf("bucket-metadata v%d > v%d (primary)", bucketmd.version(), v)
-		} else if v > bucketmd.version() { // fixup
-			glog.Errorf("Warning: bucket-metadata v%d < v%d (primary) - updating...", bucketmd.version(), v)
+		} else if v < bmd.Version {
+			glog.Errorf("bucket-metadata v%d > v%d (primary)", bmd.Version, v)
+		} else if v > bmd.Version { // fixup
+			glog.Errorf("Warning: bucket-metadata v%d < v%d (primary) - updating...", bmd.Version, v)
 			t.bmdVersionFixup()
-			islocal := t.bmdowner.get().islocal(bucket)
+			islocal := t.bmdowner.get().IsLocal(bucket)
 			if islocal == proxylocal {
-				glog.Infof("Success: updated bucket-metadata to v%d - resolved 'islocal' mismatch", bucketmd.version())
+				glog.Infof("Success: updated bucket-metadata to v%d - resolved 'islocal' mismatch", bmd.Version)
 				errstr, errcode = "", 0
 			}
 		}
@@ -2663,7 +2486,7 @@ func (t *targetrunner) bmdVersionFixup() {
 			path:   cmn.URLPath(cmn.Version, cmn.Daemon),
 			query:  q,
 		},
-		timeout: ctx.config.Timeout.CplaneOperation,
+		timeout: cmn.GCO.Get().Timeout.CplaneOperation,
 	}
 	res := t.call(args)
 	if res.err != nil {
@@ -2717,13 +2540,13 @@ func (t *targetrunner) httpdaeput(w http.ResponseWriter, r *http.Request) {
 			return
 		case cmn.SyncSmap:
 			var newsmap = &smapX{}
-			if t.readJSON(w, r, newsmap) != nil {
+			if cmn.ReadJSON(w, r, newsmap) != nil {
 				return
 			}
 			if errstr := t.smapowner.synchronize(newsmap, false /*saveSmap*/, true /* lesserIsErr */); errstr != "" {
 				t.invalmsghdlr(w, r, fmt.Sprintf("Failed to sync Smap: %s", errstr))
 			}
-			glog.Infof("%s: %s v%d done", t.si.DaemonID, cmn.SyncSmap, newsmap.version())
+			glog.Infof("%s: %s v%d done", t.si, cmn.SyncSmap, newsmap.version())
 			return
 		case cmn.Mountpaths:
 			t.handleMountpathReq(w, r)
@@ -2735,7 +2558,7 @@ func (t *targetrunner) httpdaeput(w http.ResponseWriter, r *http.Request) {
 	// other PUT /daemon actions
 	//
 	var msg cmn.ActionMsg
-	if t.readJSON(w, r, &msg) != nil {
+	if cmn.ReadJSON(w, r, &msg) != nil {
 		return
 	}
 	switch msg.Action {
@@ -2747,7 +2570,7 @@ func (t *targetrunner) httpdaeput(w http.ResponseWriter, r *http.Request) {
 		} else {
 			glog.Infof("setconfig %s=%s", msg.Name, value)
 			if msg.Name == "lru_enabled" && value == "false" {
-				_, lruxact := t.xactinp.findU(cmn.ActLRU)
+				lruxact := t.xactions.findU(cmn.ActLRU)
 				if lruxact != nil {
 					if glog.V(3) {
 						glog.Infof("Aborting LRU due to lru_enabled config change")
@@ -2819,9 +2642,7 @@ func (t *targetrunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
 		t.httprunner.httpdaeget(w, r)
 	case cmn.GetWhatStats:
 		rst := getstorstatsrunner()
-		rst.RLock()
-		jsbytes, err := jsoniter.Marshal(rst)
-		rst.RUnlock()
+		jsbytes, err := rst.GetWhatStats()
 		cmn.Assert(err == nil, err)
 		t.writeJSON(w, r, jsbytes, "httpdaeget-"+getWhat)
 	case cmn.GetWhatXaction:
@@ -2830,13 +2651,21 @@ func (t *targetrunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
 			t.invalmsghdlr(w, r, errstr)
 			return
 		}
-		xactionStatsRetriever := t.getXactionStatsRetriever(kind) // FIXME
-		allXactionDetails := t.getXactionsByType(kind)
-		jsbytes := xactionStatsRetriever.getStats(allXactionDetails)
+		var (
+			jsbytes           []byte
+			sts               = getstorstatsrunner()
+			allXactionDetails = t.getXactionsByKind(kind)
+		)
+		if kind == cmn.XactionRebalance {
+			jsbytes = sts.GetRebalanceStats(allXactionDetails)
+		} else {
+			cmn.Assert(kind == cmn.XactionPrefetch)
+			jsbytes = sts.GetPrefetchStats(allXactionDetails)
+		}
 		t.writeJSON(w, r, jsbytes, "httpdaeget-"+getWhat)
 	case cmn.GetWhatMountpaths:
 		mpList := cmn.MountpathList{}
-		availablePaths, disabledPaths := fs.Mountpaths.Mountpaths()
+		availablePaths, disabledPaths := fs.Mountpaths.Get()
 		mpList.Available = make([]string, len(availablePaths))
 		mpList.Disabled = make([]string, len(disabledPaths))
 
@@ -2862,31 +2691,16 @@ func (t *targetrunner) httpdaeget(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (t *targetrunner) getXactionStatsRetriever(kind string) XactionStatsRetriever {
-	var xactionStatsRetriever XactionStatsRetriever
-
-	// No need to handle default since kind has already been validated by
-	// this point.
-	switch kind {
-	case cmn.XactionRebalance:
-		xactionStatsRetriever = RebalanceTargetStats{}
-	case cmn.XactionPrefetch:
-		xactionStatsRetriever = PrefetchTargetStats{}
-	}
-
-	return xactionStatsRetriever
-}
-
-func (t *targetrunner) getXactionsByType(kind string) []XactionDetails {
-	allXactionDetails := []XactionDetails{}
-	for _, xaction := range t.xactinp.xactinp {
+func (t *targetrunner) getXactionsByKind(kind string) []stats.XactionDetails {
+	allXactionDetails := []stats.XactionDetails{}
+	for _, xaction := range t.xactions.v {
 		if xaction.Kind() == kind {
 			status := cmn.XactionStatusCompleted
 			if !xaction.Finished() {
 				status = cmn.XactionStatusInProgress
 			}
 
-			xactionStats := XactionDetails{
+			xactionStats := stats.XactionDetails{
 				Id:        xaction.ID(),
 				StartTime: xaction.StartTime(),
 				EndTime:   xaction.EndTime(),
@@ -2926,13 +2740,13 @@ func (t *targetrunner) httpdaepost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if status, err := t.register(false, defaultTimeout); err != nil {
-		s := fmt.Sprintf("Target %s failed to register with proxy, status %d, err: %v", t.si.DaemonID, status, err)
+		s := fmt.Sprintf("%s failed to register with proxy, status %d, err: %v", t.si, status, err)
 		t.invalmsghdlr(w, r, s)
 		return
 	}
 
 	if glog.V(3) {
-		glog.Infof("Registered self %s", t.si.DaemonID)
+		glog.Infof("Registered self %s", t.si)
 	}
 }
 
@@ -2955,7 +2769,7 @@ func (t *targetrunner) httpdaedelete(w http.ResponseWriter, r *http.Request) {
 		gettargetkeepalive().keepalive.controlCh <- controlSignal{msg: unregister}
 		return
 	default:
-		t.invalmsghdlr(w, r, "unrecognized path in /daemon DELETE")
+		t.invalmsghdlr(w, r, fmt.Sprintf("unrecognized path: %q in /daemon DELETE", apiItems[0]))
 		return
 	}
 }
@@ -2967,33 +2781,29 @@ func (t *targetrunner) httpdaedelete(w http.ResponseWriter, r *http.Request) {
 // xxhash is always preferred over md5
 //
 //==============================================================================================
-func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalue,
-	reader io.Reader) (sgl *memsys.SGL, nhobj cksumvalue, written int64, errstr string) {
+func (t *targetrunner) receive(workfqn string, lom *cluster.LOM, omd5 string,
+	reader io.Reader) (sgl *memsys.SGL /* NIY */, nhobj cmn.CksumValue, written int64, errstr string) {
 	var (
-		err                  error
-		file                 *os.File
-		filewriter           io.Writer
-		ohtype, ohval, nhval string
-		cksumcfg             = &ctx.config.Cksum
+		err        error
+		file       *os.File
+		filewriter io.Writer
+		nhval      string
+		cksumcfg   = &cmn.GCO.Get().Cksum
 	)
 
 	if dryRun.disk && dryRun.network {
 		return
 	}
-	// try to override cksum config with bucket-level config
-	if bucket, _, err := t.fqn2bckobj(fqn); err == nil {
-		if bucketProps, _, defined := t.bmdowner.get().propsAndChecksum(bucket); defined {
-			cksumcfg = &bucketProps.CksumConfig
-		}
+	if lom.Cksumcfg == nil { // FIXME: always initialize in the callers, include aws/gcp
+		lom.Fill(0)
 	}
-
 	if dryRun.network {
 		reader = readers.NewRandReader(dryRun.size)
 	}
 	if !dryRun.disk {
-		if file, err = cmn.CreateFile(fqn); err != nil {
-			t.fshc(err, fqn)
-			errstr = fmt.Sprintf("Failed to create %s, err: %s", fqn, err)
+		if file, err = cmn.CreateFile(workfqn); err != nil {
+			t.fshc(err, workfqn)
+			errstr = fmt.Sprintf("Failed to create %s, err: %s", workfqn, err)
 			return
 		}
 		filewriter = file
@@ -3009,10 +2819,10 @@ func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalu
 		}
 		if !dryRun.disk {
 			if err = file.Close(); err != nil {
-				glog.Errorf("Nested: failed to close received file %s, err: %v", fqn, err)
+				glog.Errorf("Nested: failed to close received file %s, err: %v", workfqn, err)
 			}
-			if err = os.Remove(fqn); err != nil {
-				glog.Errorf("Nested error %s => (remove %s => err: %v)", errstr, fqn, err)
+			if err = os.Remove(workfqn); err != nil {
+				glog.Errorf("Nested error %s => (remove %s => err: %v)", errstr, workfqn, err)
 			}
 		}
 	}()
@@ -3023,34 +2833,30 @@ func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalu
 		}
 		if !dryRun.disk {
 			if err = file.Close(); err != nil {
-				errstr = fmt.Sprintf("Failed to close received file %s, err: %v", fqn, err)
+				errstr = fmt.Sprintf("Failed to close received file %s, err: %v", workfqn, err)
 			}
 		}
 		return
 	}
 
 	// receive and checksum
-	if cksumcfg.Checksum != cmn.ChecksumNone {
+	if lom.Cksumcfg.Checksum != cmn.ChecksumNone {
 		cmn.Assert(cksumcfg.Checksum == cmn.ChecksumXXHash)
 		xx := xxhash.New64()
 		if written, err = cmn.ReceiveAndChecksum(filewriter, reader, buf, xx); err != nil {
 			errstr = err.Error()
-			t.fshc(err, fqn)
+			t.fshc(err, workfqn)
 			return
 		}
 		hashIn64 := xx.Sum64()
 		hashInBytes := make([]byte, 8)
 		binary.BigEndian.PutUint64(hashInBytes, hashIn64)
 		nhval = hex.EncodeToString(hashInBytes)
-		nhobj = newcksumvalue(cmn.ChecksumXXHash, nhval)
-		if ohobj != nil {
-			ohtype, ohval = ohobj.get()
-			cmn.Assert(ohtype == cmn.ChecksumXXHash)
-			if ohval != nhval {
-				errstr = fmt.Sprintf("Bad checksum: %s %s %.8s... != %.8s... computed for the %q",
-					objname, cksumcfg.Checksum, ohval, nhval, fqn)
-
-				t.statsif.addMany(namedVal64{statErrCksumCount, 1}, namedVal64{statErrCksumSize, written})
+		nhobj = cmn.NewCksum(cmn.ChecksumXXHash, nhval)
+		if lom.Nhobj != nil {
+			if !cmn.EqCksum(nhobj, lom.Nhobj) {
+				errstr = fmt.Sprintf("%s work %q", lom.BadChecksum(nhobj), workfqn)
+				t.statsif.AddMany(stats.NamedVal64{stats.ErrCksumCount, 1}, stats.NamedVal64{stats.ErrCksumSize, written})
 				return
 			}
 		}
@@ -3058,27 +2864,25 @@ func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalu
 		md5 := md5.New()
 		if written, err = cmn.ReceiveAndChecksum(filewriter, reader, buf, md5); err != nil {
 			errstr = err.Error()
-			t.fshc(err, fqn)
+			t.fshc(err, workfqn)
 			return
 		}
 		hashInBytes := md5.Sum(nil)[:16]
 		md5hash := hex.EncodeToString(hashInBytes)
 		if omd5 != md5hash {
-			errstr = fmt.Sprintf("Bad checksum: cold GET %s md5 %.8s... != %.8s... computed for the %q",
-				objname, ohval, nhval, fqn)
-
-			t.statsif.addMany(namedVal64{statErrCksumCount, 1}, namedVal64{statErrCksumSize, written})
+			errstr = fmt.Sprintf("Bad md5: %s %s != %s work %q", lom, omd5, md5hash, workfqn)
+			t.statsif.AddMany(stats.NamedVal64{stats.ErrCksumCount, 1}, stats.NamedVal64{stats.ErrCksumSize, written})
 			return
 		}
 	} else {
 		if written, err = cmn.ReceiveAndChecksum(filewriter, reader, buf); err != nil {
 			errstr = err.Error()
-			t.fshc(err, fqn)
+			t.fshc(err, workfqn)
 			return
 		}
 	}
 	if err = file.Close(); err != nil {
-		errstr = fmt.Sprintf("Failed to close received file %s, err: %v", fqn, err)
+		errstr = fmt.Sprintf("Failed to close received file %s, err: %v", workfqn, err)
 	}
 	return
 }
@@ -3088,10 +2892,6 @@ func (t *targetrunner) receive(fqn string, objname, omd5 string, ohobj cksumvalu
 // target's misc utilities and helpers
 //
 //==============================================================================
-func (t *targetrunner) starttime() time.Time {
-	return t.uxprocess.starttime
-}
-
 func (t *targetrunner) redirectLatency(started time.Time, query url.Values) (redelta int64) {
 	s := query.Get(cmn.URLParamUnixTime)
 	if s == "" {
@@ -3106,89 +2906,31 @@ func (t *targetrunner) redirectLatency(started time.Time, query url.Values) (red
 	return
 }
 
-// the opposite
-func (t *targetrunner) fqn2bckobj(fqn string) (bucket, objName string, err error) {
-	var (
-		isLocal   bool
-		parsedFQN fqnParsed
-	)
-
-	parsedFQN, err = fqn2info(fqn)
-	if err != nil {
-		return
-	}
-
-	bucket, objName, isLocal = parsedFQN.bucket, parsedFQN.objname, parsedFQN.islocal
-	bucketmd := t.bmdowner.get()
-	realFQN, errstr := cluster.FQN(bucket, objName, isLocal)
-	if errstr != "" {
-		return "", "", errors.New(errstr)
-	}
-	if realFQN != fqn || bucketmd.islocal(bucket) != isLocal {
-		err = fmt.Errorf("Cannot convert %q => %s/%s - localbuckets or device mountpaths changed?", fqn, bucket, objName)
-		return
-	}
-
-	return
-}
-
-// changedMountpath checks if the mountpath for provided fqn has changed. This
-// situation can happen when new mountpath is added or mountpath is moved from
-// disabled to enabled.
-func (t *targetrunner) changedMountpath(fqn string) (bool, string, error) {
-	parsedFQN, err := fqn2info(fqn)
-	if err != nil {
-		return false, "", err
-	}
-	bucket, objName, isLocal := parsedFQN.bucket, parsedFQN.objname, parsedFQN.islocal
-	newFQN, errstr := cluster.FQN(bucket, objName, isLocal)
-	if errstr != "" {
-		return false, "", errors.New(errstr)
-	}
-	return fqn != newFQN, newFQN, nil
-}
-
 // create local directories to test multiple fspaths
 func (t *targetrunner) testCachepathMounts() {
+	config := cmn.GCO.Get()
 	var instpath string
-	if ctx.config.TestFSP.Instance > 0 {
-		instpath = filepath.Join(ctx.config.TestFSP.Root, strconv.Itoa(ctx.config.TestFSP.Instance))
+	if config.TestFSP.Instance > 0 {
+		instpath = filepath.Join(config.TestFSP.Root, strconv.Itoa(config.TestFSP.Instance))
 	} else {
 		// container, VM, etc.
-		instpath = ctx.config.TestFSP.Root
+		instpath = config.TestFSP.Root
 	}
-	for i := 0; i < ctx.config.TestFSP.Count; i++ {
+	for i := 0; i < config.TestFSP.Count; i++ {
 		mpath := filepath.Join(instpath, strconv.Itoa(i+1))
 		if err := cmn.CreateDir(mpath); err != nil {
 			glog.Errorf("FATAL: cannot create test cache dir %q, err: %v", mpath, err)
 			os.Exit(1)
 		}
 
-		err := fs.Mountpaths.AddMountpath(mpath)
+		err := fs.Mountpaths.Add(mpath)
 		cmn.Assert(err == nil, err)
 	}
 }
 
-func (t *targetrunner) createBucketDirs(s, basename string, f func(basePath string) string) error {
-	if basename == "" {
-		return fmt.Errorf("empty basename for the %s buckets directory - update your config", s)
-	}
-	availablePaths, _ := fs.Mountpaths.Mountpaths()
-	for _, mpathInfo := range availablePaths {
-		dir := f(mpathInfo.Path)
-		if _, exists := availablePaths[dir]; exists {
-			return fmt.Errorf("local namespace partitioning conflict: %s vs %s", mpathInfo.Path, dir)
-		}
-		if err := cmn.CreateDir(dir); err != nil {
-			return fmt.Errorf("cannot create %s buckets dir %q, err: %v", s, dir, err)
-		}
-	}
-	return nil
-}
-
 func (t *targetrunner) detectMpathChanges() {
 	// mpath config dir
-	mpathconfigfqn := filepath.Join(ctx.config.Confdir, mpname)
+	mpathconfigfqn := filepath.Join(cmn.GCO.Get().Confdir, cmn.MountpathBackupFile)
 
 	type mfs struct {
 		Available cmn.StringSet `json:"available"`
@@ -3204,7 +2946,7 @@ func (t *targetrunner) detectMpathChanges() {
 		}
 	)
 
-	availablePaths, disabledPath := fs.Mountpaths.Mountpaths()
+	availablePaths, disabledPath := fs.Mountpaths.Get()
 	for mpath := range availablePaths {
 		newfs.Available[mpath] = struct{}{}
 	}
@@ -3229,7 +2971,7 @@ func (t *targetrunner) detectMpathChanges() {
 			newfs.Available.String(), newfs.Disabled.String(),
 		)
 
-		glog.Errorf("%s: detected change in the mountpath configuration at %s", t.si.DaemonID, mpathconfigfqn)
+		glog.Errorf("%s: detected change in the mountpath configuration at %s", t.si, mpathconfigfqn)
 		glog.Errorln("OLD: ====================")
 		glog.Errorln(oldfsPprint)
 		glog.Errorln("NEW: ====================")
@@ -3241,87 +2983,21 @@ func (t *targetrunner) detectMpathChanges() {
 	}
 }
 
-// versioningConfigured returns true if versioning for a given bucket is enabled
-// NOTE:
-//    AWS bucket versioning can be disabled on the cloud. In this case we do not
-//    save/read/update version using xattrs. And the function returns that the
-//    versioning is unsupported even if versioning is 'all' or 'cloud'.
-func (t *targetrunner) versioningConfigured(bucket string) bool {
-	islocal := t.bmdowner.get().islocal(bucket)
-	versioning := ctx.config.Ver.Versioning
-	if islocal {
-		return versioning == cmn.VersionAll || versioning == cmn.VersionLocal
-	}
-	return versioning == cmn.VersionAll || versioning == cmn.VersionCloud
-}
-
-// xattrs
-func (t *targetrunner) finalizeobj(fqn, bucket string, objprops *objectProps) (errstr string) {
-	if objprops.nhobj != nil {
-		htype, hval := objprops.nhobj.get()
-		cmn.Assert(htype == cmn.ChecksumXXHash)
-		if errstr = Setxattr(fqn, cmn.XattrXXHashVal, []byte(hval)); errstr != "" {
-			return errstr
-		}
-	}
-	if objprops.version != "" {
-		errstr = Setxattr(fqn, cmn.XattrObjVersion, []byte(objprops.version))
-	}
-
-	if !objprops.atime.IsZero() && t.bucketLRUEnabled(bucket) {
-		getatimerunner().touch(fqn, objprops.atime)
-	}
-
-	return
-}
-
-// increaseObjectVersion increments the current version xattrs and returns the new value.
-// If the current version is empty (local bucket versioning (re)enabled, new file)
-// the version is set to "1"
-func (t *targetrunner) increaseObjectVersion(fqn string) (newVersion string, errstr string) {
-	const initialVersion = "1"
-	var (
-		err    error
-		vbytes []byte
-	)
-	_, err = os.Stat(fqn)
-	if err != nil && os.IsNotExist(err) {
-		newVersion = initialVersion
-		return
-	}
-	if err != nil {
-		errstr = fmt.Sprintf("Unexpected failure to read stats of file %s, err: %v", fqn, err)
-		return
-	}
-
-	if vbytes, errstr = Getxattr(fqn, cmn.XattrObjVersion); errstr != "" {
-		return
-	}
-	if currValue, err := strconv.Atoi(string(vbytes)); err != nil {
-		newVersion = initialVersion
-	} else {
-		newVersion = fmt.Sprintf("%d", currValue+1)
-	}
-
-	return
-}
-
 // fshc wakes up FSHC and makes it to run filesystem check immediately if err != nil
 func (t *targetrunner) fshc(err error, filepath string) {
-	glog.Errorf("FSHC called with error: %#v, file: %s", err, filepath)
-
-	if !isIOError(err) {
+	glog.Errorf("FSHC: fqn %s, err %v", filepath, err)
+	if !cmn.IsIOError(err) {
 		return
 	}
-	mpathInfo, _ := path2mpathInfo(filepath)
+	mpathInfo, _ := fs.Mountpaths.Path2MpathInfo(filepath)
 	if mpathInfo != nil {
 		keyName := mpathInfo.Path
 		// keyName is the mountpath is the fspath - counting IO errors on a per basis..
 		t.statsdC.Send(keyName+".io.errors", metric{statsd.Counter, "count", 1})
 	}
 
-	if ctx.config.FSHC.Enabled {
-		getfshealthchecker().onerr(filepath)
+	if cmn.GCO.Get().FSHC.Enabled {
+		getfshealthchecker().OnErr(filepath)
 	}
 }
 
@@ -3357,8 +3033,9 @@ func (t *targetrunner) userFromRequest(r *http.Request) (*authRec, error) {
 // Extracted user information is put to context that is passed to all consumers
 func (t *targetrunner) contextWithAuth(r *http.Request) context.Context {
 	ct := context.Background()
+	config := cmn.GCO.Get()
 
-	if ctx.config.Auth.CredDir == "" || !ctx.config.Auth.Enabled {
+	if config.Auth.CredDir == "" || !config.Auth.Enabled {
 		return ct
 	}
 
@@ -3370,7 +3047,7 @@ func (t *targetrunner) contextWithAuth(r *http.Request) context.Context {
 
 	if user != nil {
 		ct = context.WithValue(ct, ctxUserID, user.userID)
-		ct = context.WithValue(ct, ctxCredsDir, ctx.config.Auth.CredDir)
+		ct = context.WithValue(ct, ctxCredsDir, config.Auth.CredDir)
 		ct = context.WithValue(ct, ctxUserCreds, user.creds)
 	}
 
@@ -3379,7 +3056,7 @@ func (t *targetrunner) contextWithAuth(r *http.Request) context.Context {
 
 func (t *targetrunner) handleMountpathReq(w http.ResponseWriter, r *http.Request) {
 	msg := cmn.ActionMsg{}
-	if t.readJSON(w, r, &msg) != nil {
+	if cmn.ReadJSON(w, r, &msg) != nil {
 		t.invalmsghdlr(w, r, "Invalid mountpath request")
 		return
 	}
@@ -3471,31 +3148,24 @@ func (t *targetrunner) receiveBucketMD(newbucketmd *bucketMD, msg *cmn.ActionMsg
 	t.bmdowner.put(newbucketmd)
 	t.bmdowner.Unlock()
 
-	availablePaths, _ := fs.Mountpaths.Mountpaths()
-	// Remove buckets which don't exist in newbucketmd
+	// Delete buckets which don't exist in (new)bucketmd
+	bucketsToDelete := make([]string, 0, len(bucketmd.LBmap))
 	for bucket := range bucketmd.LBmap {
 		if _, ok := newbucketmd.LBmap[bucket]; !ok {
-			glog.Infof("Destroy local bucket %s", bucket)
-			for _, mpathInfo := range availablePaths {
-				localbucketfqn := filepath.Join(fs.Mountpaths.MakePathLocal(mpathInfo.Path), bucket)
-				if err := os.RemoveAll(localbucketfqn); err != nil {
-					glog.Errorf("Failed to destroy local bucket dir %q, err: %v", localbucketfqn, err)
-				}
-			}
+			bucketsToDelete = append(bucketsToDelete, bucket)
 		}
 	}
+	removeBuckets("receive-bucketmd", bucketsToDelete...)
 
 	// Create buckets which don't exist in (old)bucketmd
+	bucketsToCreate := make([]string, 0, len(newbucketmd.LBmap))
 	for bucket := range newbucketmd.LBmap {
 		if _, ok := bucketmd.LBmap[bucket]; !ok {
-			for _, mpathInfo := range availablePaths {
-				localbucketfqn := filepath.Join(fs.Mountpaths.MakePathLocal(mpathInfo.Path), bucket)
-				if err := cmn.CreateDir(localbucketfqn); err != nil {
-					glog.Errorf("Failed to create local bucket dir %q, err: %v", localbucketfqn, err)
-				}
-			}
+			bucketsToCreate = append(bucketsToCreate, bucket)
 		}
 	}
+	createBuckets("receive-bucketmd", bucketsToCreate...)
+
 	return
 }
 
@@ -3516,13 +3186,13 @@ func (t *targetrunner) receiveSmap(newsmap *smapX, msg *cmn.ActionMsg) (errstr s
 	for id, si := range newsmap.Tmap { // log
 		if id == t.si.DaemonID {
 			existentialQ = true
-			glog.Infof("target: %s <= self", si.DaemonID)
+			glog.Infof("target: %s <= self", si)
 		} else {
-			glog.Infof("target: %s", si.DaemonID)
+			glog.Infof("target: %s", si)
 		}
 	}
 	if !existentialQ {
-		errstr = fmt.Sprintf("Not finding self %s in the new %s", t.si.DaemonID, newsmap.pp())
+		errstr = fmt.Sprintf("Not finding self %s in the new %s", t.si, newsmap.pp())
 		return
 	}
 	if errstr = t.smapowner.synchronize(newsmap, false /*saveSmap*/, true /* lesserIsErr */); errstr != "" {
@@ -3532,7 +3202,7 @@ func (t *targetrunner) receiveSmap(newsmap *smapX, msg *cmn.ActionMsg) (errstr s
 		go t.runRebalance(newsmap, newtargetid)
 		return
 	}
-	if !ctx.config.Rebalance.Enabled {
+	if !cmn.GCO.Get().Rebalance.Enabled {
 		glog.Infoln("auto-rebalancing disabled")
 		return
 	}
@@ -3545,7 +3215,7 @@ func (t *targetrunner) receiveSmap(newsmap *smapX, msg *cmn.ActionMsg) (errstr s
 		return
 	}
 
-	aborted, running = t.xactinp.isAbortedOrRunningRebalance()
+	aborted, running = t.xactions.isAbortedOrRunningRebalance()
 	if !aborted || running {
 		glog.Infof("the cluster is starting up, rebalancing=(aborted=%t, running=%t)", aborted, running)
 		return
@@ -3587,42 +3257,18 @@ func (t *targetrunner) pollClusterStarted() {
 		if res.err != nil {
 			continue
 		}
-		proxystats := &proxyCoreStats{}
+		proxystats := &stats.ProxyCoreStats{} // FIXME
 		err := jsoniter.Unmarshal(res.outjson, proxystats)
 		if err != nil {
 			glog.Errorf("Unexpected: failed to unmarshal %s response, err: %v [%v]", psi.PublicNet.DirectURL, err, string(res.outjson))
 			continue
 		}
-		if proxystats.Tracker[statUptimeLatency].Value != 0 {
+		if proxystats.Tracker[stats.Uptime].Value != 0 {
 			break
 		}
 	}
 	atomic.StoreInt64(&t.clusterStarted, 1)
 	glog.Infoln("cluster started up")
-}
-
-// broadcastNeighbors sends a message ([]byte) to all neighboring targets belongs to a smap
-func (t *targetrunner) broadcastNeighbors(path string, query url.Values, method string, body []byte,
-	smap *smapX, timeout time.Duration) chan callResult {
-
-	if len(smap.Tmap) < 2 {
-		// no neighbor, returns empty channel, so caller doesnt have to check channel is nil
-		ch := make(chan callResult)
-		close(ch)
-		return ch
-	}
-
-	bcastArgs := bcastCallArgs{
-		req: reqArgs{
-			method: method,
-			path:   path,
-			query:  query,
-			body:   body,
-		},
-		timeout: timeout,
-		servers: []map[string]*cluster.Snode{smap.Tmap},
-	}
-	return t.broadcast(bcastArgs)
 }
 
 func (t *targetrunner) httpTokenDelete(w http.ResponseWriter, r *http.Request) {
@@ -3631,49 +3277,13 @@ func (t *targetrunner) httpTokenDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := t.readJSON(w, r, tokenList); err != nil {
+	if err := cmn.ReadJSON(w, r, tokenList); err != nil {
 		s := fmt.Sprintf("Invalid token list: %v", err)
 		t.invalmsghdlr(w, r, s)
 		return
 	}
 
 	t.authn.updateRevokedList(tokenList)
-}
-
-func (t *targetrunner) validateObjectChecksum(fqn string, checksumAlgo string, slabSize int64) (validChecksum bool, errstr string) {
-	if checksumAlgo != cmn.ChecksumXXHash {
-		errstr := fmt.Sprintf("Unsupported checksum algorithm: [%s]", checksumAlgo)
-		return false, errstr
-	}
-
-	xxHashBinary, errstr := Getxattr(fqn, cmn.XattrXXHashVal)
-	if errstr != "" {
-		errstr = fmt.Sprintf("Unable to read checksum of object [%s], err: %s", fqn, errstr)
-		return false, errstr
-	}
-
-	if xxHashBinary == nil {
-		glog.Warningf("%s has no checksum - cannot validate", fqn)
-		return true, ""
-	}
-
-	file, err := os.Open(fqn)
-	if err != nil {
-		errstr := fmt.Sprintf("Failed to read object %s, err: %v", fqn, err)
-		return false, errstr
-	}
-
-	buf, slab := gmem2.AllocFromSlab2(slabSize)
-	xxHashVal, errstr := cmn.ComputeXXHash(file, buf)
-	file.Close()
-	slab.Free(buf)
-
-	if errstr != "" {
-		errstr := fmt.Sprintf("Unable to compute xxHash, err: %s", errstr)
-		return false, errstr
-	}
-
-	return string(xxHashBinary) == xxHashVal, ""
 }
 
 // unregisters the target and marks it as disabled by an internal event
@@ -3694,7 +3304,7 @@ func (t *targetrunner) disable() error {
 	for i := 0; i < maxRetrySeconds; i++ {
 		if status, eunreg = t.unregister(); eunreg != nil {
 			if cmn.IsErrConnectionRefused(eunreg) || status == http.StatusRequestTimeout {
-				glog.Errorf("Target %s: retrying unregistration...", t.si.DaemonID)
+				glog.Errorf("Target %s: retrying unregistration...", t.si)
 				time.Sleep(time.Second)
 				continue
 			}
@@ -3733,7 +3343,7 @@ func (t *targetrunner) enable() error {
 	for i := 0; i < maxRetrySeconds; i++ {
 		if status, ereg = t.register(false, defaultTimeout); ereg != nil {
 			if cmn.IsErrConnectionRefused(ereg) || status == http.StatusRequestTimeout {
-				glog.Errorf("Target %s: retrying registration...", t.si.DaemonID)
+				glog.Errorf("Target %s: retrying registration...", t.si)
 				time.Sleep(time.Second)
 				continue
 			}
@@ -3754,21 +3364,21 @@ func (t *targetrunner) enable() error {
 	return nil
 }
 
-// DisableMountpath implements fspathDispatcher interface
-func (t *targetrunner) DisableMountpath(mountpath string, why string) (disabled, exists bool) {
+// Disable implements fspathDispatcher interface
+func (t *targetrunner) Disable(mountpath string, why string) (disabled, exists bool) {
 	// TODO: notify admin that the mountpath is gone
 	glog.Warningf("Disabling mountpath %s: %s", mountpath, why)
 	return t.fsprg.disableMountpath(mountpath)
 }
 
-func (t *targetrunner) getFromNeighborFS(bucket, object string, islocal bool) (fqn string, size int64) {
-	availablePaths, _ := fs.Mountpaths.Mountpaths()
+func (t *targetrunner) getFromOtherLocalFS(bucket, object string, islocal bool) (fqn string, size int64) {
+	availablePaths, _ := fs.Mountpaths.Get()
 	fn := fs.Mountpaths.MakePathCloud
 	if islocal {
 		fn = fs.Mountpaths.MakePathLocal
 	}
 	for _, mpathInfo := range availablePaths {
-		dir := fn(mpathInfo.Path)
+		dir := fn(mpathInfo.Path, fs.ObjectType)
 
 		filePath := filepath.Join(dir, bucket, object)
 		stat, err := os.Stat(filePath)
@@ -3780,65 +3390,50 @@ func (t *targetrunner) getFromNeighborFS(bucket, object string, islocal bool) (f
 	return "", 0
 }
 
-func (t *targetrunner) isRebalancing() bool {
-	_, running := t.xactinp.isAbortedOrRunningRebalance()
-	_, runningLocal := t.xactinp.isAbortedOrRunningLocalRebalance()
-	return running || runningLocal
-}
+func removeBuckets(op string, buckets ...string) {
+	availablePaths, _ := fs.Mountpaths.Get()
+	contentTypes := fs.CSM.RegisteredContentTypes
 
-//====================== LRU: initiation  ======================================
-//
-// construct LRU contexts (lructx) and run them each of them in
-// the respective goroutines which then do rest of the work - see lru.go
-//
-//==============================================================================
-
-func (t *targetrunner) runLRU() {
-	xlru := t.xactinp.renewLRU(t)
-	if xlru == nil {
-		return
-	}
 	wg := &sync.WaitGroup{}
-
-	glog.Infof("LRU: %s started: dont-evict-time %v", xlru, ctx.config.LRU.DontEvictTime)
-
-	//
-	// NOTE the sequence: LRU local buckets first, Cloud buckets - second
-	//
-
-	availablePaths, _ := fs.Mountpaths.Mountpaths()
-	for path, mpathInfo := range availablePaths {
-		lctx := t.newlru(xlru, mpathInfo, fs.Mountpaths.MakePathLocal(path))
+	for _, mpathInfo := range availablePaths {
 		wg.Add(1)
-		go lctx.onelru(wg)
+		go func(mi *fs.MountpathInfo) {
+			for _, bucket := range buckets {
+				for contentType := range contentTypes {
+					localBucketFQN := filepath.Join(fs.Mountpaths.MakePathLocal(mi.Path, contentType), bucket)
+					glog.Warningf("%s: FastRemoveDir %q for content-type %q, bucket %q", op, localBucketFQN, contentType, bucket)
+					if err := mi.FastRemoveDir(localBucketFQN); err != nil {
+						// TODO: in case of error, we need to abort and rollback whole operation
+						glog.Errorf("Failed to destroy local bucket dir %q, err: %v", localBucketFQN, err)
+					}
+				}
+			}
+			wg.Done()
+		}(mpathInfo)
 	}
 	wg.Wait()
-	for path, mpathInfo := range availablePaths {
-		lctx := t.newlru(xlru, mpathInfo, fs.Mountpaths.MakePathCloud(path))
-		wg.Add(1)
-		go lctx.onelru(wg)
-	}
-	wg.Wait()
-
-	if glog.V(4) {
-		lruCheckResults(availablePaths)
-	}
-	xlru.EndTime(time.Now())
-	glog.Infoln(xlru.String())
-	t.xactinp.del(xlru.ID())
 }
 
-// construct lructx
-func (t *targetrunner) newlru(xlru *xactLRU, mpathInfo *fs.MountpathInfo, bucketdir string) *lructx {
-	lctx := &lructx{
-		oldwork:     make([]*fileInfo, 0, 64),
-		xlru:        xlru,
-		t:           t,
-		fs:          mpathInfo.FileSystem,
-		bucketdir:   bucketdir,
-		thrparams:   throttleParams{throttle: onDiskUtil | onFSUsed, fs: mpathInfo.FileSystem},
-		atimeRespCh: make(chan *atimeResponse, 1),
-		namelocker:  t.rtnamemap,
+func createBuckets(op string, buckets ...string) {
+	availablePaths, _ := fs.Mountpaths.Get()
+	contentTypes := fs.CSM.RegisteredContentTypes
+
+	wg := &sync.WaitGroup{}
+	for _, mpathInfo := range availablePaths {
+		wg.Add(1)
+		go func(mi *fs.MountpathInfo) {
+			for _, bucket := range buckets {
+				for contentType := range contentTypes {
+					localBucketFQN := filepath.Join(fs.Mountpaths.MakePathLocal(mi.Path, contentType), bucket)
+					glog.Warningf("%s: CreateDir %q for content-type %q, bucket %q", op, localBucketFQN, contentType, bucket)
+					if err := cmn.CreateDir(localBucketFQN); err != nil {
+						// TODO: in case of error, we need to abort and rollback whole operation
+						glog.Errorf("Failed to create local bucket dir %q, err: %v", localBucketFQN, err)
+					}
+				}
+			}
+			wg.Done()
+		}(mpathInfo)
 	}
-	return lctx
+	wg.Wait()
 }

@@ -40,7 +40,6 @@ from openapi_client.models.daemon_configuration_test_fspaths import DaemonConfig
 from openapi_client.models.daemon_configuration_timeout import DaemonConfigurationTimeout
 from openapi_client.models.daemon_configuration_version_config import DaemonConfigurationVersionConfig
 from openapi_client.models.daemon_core_statistics import DaemonCoreStatistics
-from openapi_client.models.daemon_info import DaemonInfo
 from openapi_client.models.file_system_capacity import FileSystemCapacity
 from openapi_client.models.get_props import GetProps
 from openapi_client.models.get_what import GetWhat
@@ -48,6 +47,7 @@ from openapi_client.models.headers import Headers
 from openapi_client.models.input_parameters import InputParameters
 from openapi_client.models.keep_alive_tracker_configuration import KeepAliveTrackerConfiguration
 from openapi_client.models.list_parameters import ListParameters
+from openapi_client.models.map_of_metrics import MapOfMetrics
 from openapi_client.models.net_info import NetInfo
 from openapi_client.models.object_properties import ObjectProperties
 from openapi_client.models.object_properties_request_params import ObjectPropertiesRequestParams
@@ -60,6 +60,9 @@ from openapi_client.models.rw_policy import RWPolicy
 from openapi_client.models.range_parameters import RangeParameters
 from openapi_client.models.rebalance_cluster_statistics import RebalanceClusterStatistics
 from openapi_client.models.rebalance_target_statistics import RebalanceTargetStatistics
+from openapi_client.models.snode import Snode
+from openapi_client.models.sort_spec import SortSpec
+from openapi_client.models.sort_spec_algorithm import SortSpecAlgorithm
 from openapi_client.models.target_core_statistics import TargetCoreStatistics
 from openapi_client.models.target_statistics import TargetStatistics
 from openapi_client.models.time_format import TimeFormat

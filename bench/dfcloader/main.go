@@ -30,7 +30,7 @@ import (
 	"github.com/NVIDIA/dfcpub/api"
 	"github.com/NVIDIA/dfcpub/bench/dfcloader/stats"
 	"github.com/NVIDIA/dfcpub/cmn"
-	"github.com/NVIDIA/dfcpub/dfc/statsd"
+	"github.com/NVIDIA/dfcpub/stats/statsd"
 	"github.com/NVIDIA/dfcpub/tutils"
 )
 
@@ -208,7 +208,8 @@ func main() {
 		}
 
 		if !exists {
-			err := api.CreateLocalBucket(tutils.HTTPClient, runParams.proxyURL, runParams.bucket)
+			baseParams := tutils.BaseAPIParams(runParams.proxyURL)
+			err := api.CreateLocalBucket(baseParams, runParams.bucket)
 			if err != nil {
 				fmt.Println("Failed to create local bucket", runParams.bucket, "err = ", err)
 				return
@@ -315,7 +316,7 @@ L:
 		completeWorkOrder(wo)
 	}
 
-	fmt.Printf("\nActual run duration: %v\n", time.Now().Sub(tsStart))
+	fmt.Printf("\nActual run duration: %v\n", time.Since(tsStart))
 	accumulatedStats.aggregate(intervalStats)
 	writeStats(statsWriter, true /* final */, intervalStats, accumulatedStats)
 
@@ -760,7 +761,8 @@ func cleanUp() {
 	wg.Wait()
 
 	if runParams.isLocal {
-		api.DestroyLocalBucket(tutils.HTTPClient, runParams.proxyURL, runParams.bucket)
+		baseParams := tutils.BaseAPIParams(runParams.proxyURL)
+		api.DestroyLocalBucket(baseParams, runParams.bucket)
 	}
 
 	fmt.Println(prettyTimeStamp() + " Clean up done")

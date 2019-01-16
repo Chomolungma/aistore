@@ -1,13 +1,11 @@
+// Package cluster provides common interfaces and local access to cluster-level metadata
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package cluster provides local access to cluster-level metadata
 package cluster
 
 import (
 	"fmt"
-	"path/filepath"
 
 	"github.com/NVIDIA/dfcpub/fs"
 	"github.com/NVIDIA/dfcpub/xoshiro256"
@@ -71,7 +69,7 @@ func HrwProxy(smap *Smap, idToSkip string) (pi *Snode, errstr string) {
 }
 
 func hrwMpath(bucket, objname string) (mpath string, errstr string) {
-	availablePaths, _ := fs.Mountpaths.Mountpaths()
+	availablePaths, _ := fs.Mountpaths.Get()
 	if len(availablePaths) == 0 {
 		errstr = fmt.Sprintf("Cannot select mountpath for %s/%s", bucket, objname)
 		return
@@ -88,16 +86,4 @@ func hrwMpath(bucket, objname string) (mpath string, errstr string) {
 		}
 	}
 	return
-}
-
-// (bucket, object) => (local hashed path, fully qualified name aka fqn & error)
-func FQN(bucket, objname string, islocal bool) (string, string) {
-	mpath, errstr := hrwMpath(bucket, objname)
-	if errstr != "" {
-		return "", errstr
-	}
-	if islocal {
-		return filepath.Join(fs.Mountpaths.MakePathLocal(mpath), bucket, objname), ""
-	}
-	return filepath.Join(fs.Mountpaths.MakePathCloud(mpath), bucket, objname), ""
 }

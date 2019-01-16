@@ -1,8 +1,7 @@
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
@@ -91,9 +90,6 @@ type revs interface {
 	version() int64                 // version - locking not required
 	marshal() (b []byte, err error) // json-marshal - ditto
 }
-type revsowner interface {
-	getif() revs
-}
 
 // private types - used internally by the metasync
 type (
@@ -113,7 +109,7 @@ type metasyncer struct {
 	p            *proxyrunner          // parent
 	revsmap      map[string]revsdaemon // sync-ed versions (cluster-wide, by DaemonID)
 	last         map[string]revs       // last/current sync-ed
-	lastclone    cmn.SimpleKVs      // to enforce CoW
+	lastclone    cmn.SimpleKVs         // to enforce CoW
 	stopCh       chan struct{}         // stop channel
 	workCh       chan revsReq          // work channel
 	retryTimer   *time.Timer           // timer to sync pending
@@ -142,6 +138,7 @@ func (y *metasyncer) Run() error {
 	glog.Infof("Starting %s", y.Getname())
 
 	for {
+		config := cmn.GCO.Get()
 		select {
 		case revsReq, ok := <-y.workCh:
 			if ok {
@@ -158,14 +155,14 @@ func (y *metasyncer) Run() error {
 					revsReq.wg.Done()
 				}
 				if cnt > 0 && y.timerStopped {
-					y.retryTimer.Reset(ctx.config.Periodic.RetrySyncTime)
+					y.retryTimer.Reset(config.Periodic.RetrySyncTime)
 					y.timerStopped = false
 				}
 			}
 		case <-y.retryTimer.C:
 			cnt := y.handlePending()
 			if cnt > 0 {
-				y.retryTimer.Reset(ctx.config.Periodic.RetrySyncTime)
+				y.retryTimer.Reset(config.Periodic.RetrySyncTime)
 				y.timerStopped = false
 			} else {
 				y.timerStopped = true
@@ -193,7 +190,7 @@ func (y *metasyncer) sync(wait bool, params ...interface{}) {
 	}
 	l := len(params) / 2
 	cmn.Assert(l > 0 && len(params) == l*2)
-	revsReq := revsReq{pairs: make([]revspair, l, l)}
+	revsReq := revsReq{pairs: make([]revspair, l)}
 	for i := 0; i < len(params); i += 2 {
 		revs, ok := params[i].(revs)
 		cmn.Assert(ok)
@@ -232,9 +229,10 @@ func (y *metasyncer) doSync(pairs []revspair) (cnt int) {
 	var (
 		jsbytes, jsmsg []byte
 		err            error
-		refused        map[string]*cluster.Snode
+		refused        cluster.NodeMap
 		payload        = make(cmn.SimpleKVs)
 		smap           = y.p.smapowner.get()
+		config         = cmn.GCO.Get()
 	)
 	newCnt := y.countNewMembers(smap)
 	// step 1: validation & enforcement (CoW, non-decremental versioning, duplication)
@@ -304,14 +302,15 @@ OUTER:
 
 	// step 3: b-cast
 	urlPath := cmn.URLPath(cmn.Version, cmn.Metasync)
-	res := y.p.broadcastCluster(
+	res := y.p.broadcastTo(
 		urlPath,
 		nil, // query
 		http.MethodPut,
 		jsbytes,
 		smap,
-		ctx.config.Timeout.CplaneOperation,
-		true,
+		config.Timeout.CplaneOperation,
+		cmn.NetworkIntraControl,
+		cluster.AllNodes,
 	)
 
 	// step 4: count failures and fill-in refused
@@ -320,10 +319,10 @@ OUTER:
 			y.syncDone(r.si.DaemonID, pairsToSend)
 			continue
 		}
-		glog.Warningf("Failed to sync %s, err: %v (%d)", r.si.DaemonID, r.err, r.status)
+		glog.Warningf("Failed to sync %s, err: %v (%d)", r.si, r.err, r.status)
 		if cmn.IsErrConnectionRefused(r.err) {
 			if refused == nil {
-				refused = make(map[string]*cluster.Snode)
+				refused = make(cluster.NodeMap)
 			}
 			refused[r.si.DaemonID] = r.si
 		} else {
@@ -336,7 +335,7 @@ OUTER:
 			break
 		}
 
-		time.Sleep(ctx.config.Timeout.CplaneOperation)
+		time.Sleep(config.Timeout.CplaneOperation)
 		smap = y.p.smapowner.get()
 		if !smap.isPrimary(y.p.si) {
 			y.becomeNonPrimary()
@@ -368,16 +367,16 @@ func (y *metasyncer) syncDone(sid string, pairs []revspair) {
 	}
 }
 
-func (y *metasyncer) handleRefused(urlPath string, body []byte, refused map[string]*cluster.Snode, pairs []revspair) {
+func (y *metasyncer) handleRefused(urlPath string, body []byte, refused cluster.NodeMap, pairs []revspair) {
 	bcastArgs := bcastCallArgs{
 		req: reqArgs{
 			method: http.MethodPut,
 			path:   urlPath,
 			body:   body,
 		},
-		internal: true,
-		timeout:  ctx.config.Timeout.CplaneOperation,
-		servers:  []map[string]*cluster.Snode{refused},
+		network: cmn.NetworkIntraControl,
+		timeout: cmn.GCO.Get().Timeout.CplaneOperation,
+		nodes:   []cluster.NodeMap{refused},
 	}
 	res := y.p.broadcast(bcastArgs)
 
@@ -385,22 +384,22 @@ func (y *metasyncer) handleRefused(urlPath string, body []byte, refused map[stri
 		if r.err == nil {
 			delete(refused, r.si.DaemonID)
 			y.syncDone(r.si.DaemonID, pairs)
-			glog.Infof("handle-refused: sync-ed %s", r.si.DaemonID)
+			glog.Infof("handle-refused: sync-ed %s", r.si)
 		} else {
-			glog.Warningf("handle-refused: failing to sync %s, err: %v (%d)", r.si.DaemonID, r.err, r.status)
+			glog.Warningf("handle-refused: failing to sync %s, err: %v (%d)", r.si, r.err, r.status)
 		}
 	}
 }
 
 // pending (map), if requested, contains only those daemons that need
 // to get at least one of the most recently sync-ed tag-ed revs
-func (y *metasyncer) pending(needMap bool) (count int, pending map[string]*cluster.Snode) {
+func (y *metasyncer) pending(needMap bool) (count int, pending cluster.NodeMap) {
 	smap := y.p.smapowner.get()
 	if !smap.isPrimary(y.p.si) {
 		y.becomeNonPrimary()
 		return
 	}
-	for _, serverMap := range []map[string]*cluster.Snode{smap.Tmap, smap.Pmap} {
+	for _, serverMap := range []cluster.NodeMap{smap.Tmap, smap.Pmap} {
 		for id, si := range serverMap {
 			revsdaemon, ok := y.revsmap[id]
 			if !ok {
@@ -426,7 +425,7 @@ func (y *metasyncer) pending(needMap bool) (count int, pending map[string]*clust
 				}
 			}
 			if pending == nil {
-				pending = make(map[string]*cluster.Snode)
+				pending = make(cluster.NodeMap)
 			}
 			pending[id] = si
 		}
@@ -464,18 +463,18 @@ func (y *metasyncer) handlePending() (cnt int) {
 			path:   cmn.URLPath(cmn.Version, cmn.Metasync),
 			body:   body,
 		},
-		internal: true,
-		timeout:  ctx.config.Timeout.CplaneOperation,
-		servers:  []map[string]*cluster.Snode{pending},
+		network: cmn.NetworkIntraControl,
+		timeout: cmn.GCO.Get().Timeout.CplaneOperation,
+		nodes:   []cluster.NodeMap{pending},
 	}
 	res := y.p.broadcast(bcastArgs)
 	for r := range res {
 		if r.err == nil {
 			y.syncDone(r.si.DaemonID, pairs)
-			glog.Infof("handle-pending: sync-ed %s", r.si.DaemonID)
+			glog.Infof("handle-pending: sync-ed %s", r.si)
 		} else {
 			cnt++
-			glog.Warningf("handle-pending: failing to sync %s, err: %v (%d)", r.si.DaemonID, r.err, r.status)
+			glog.Warningf("handle-pending: failing to sync %s, err: %v (%d)", r.si, r.err, r.status)
 		}
 	}
 	return
@@ -495,7 +494,7 @@ func (y *metasyncer) checkPrimary() bool {
 	if smap.ProxySI != nil {
 		lead = smap.ProxySI.DaemonID
 	}
-	glog.Errorf("%s self is not %s (primary=%s, Smap v%d) - failing the 'sync' request", y.p.si.DaemonID, reason, lead, smap.version())
+	glog.Errorf("%s self is not %s (primary=%s, Smap v%d) - failing the 'sync' request", y.p.si, reason, lead, smap.version())
 	return false
 }
 
@@ -507,8 +506,8 @@ func (y *metasyncer) lversion(tag string) int64 {
 }
 
 func (y *metasyncer) countNewMembers(smap *smapX) (count int) {
-	for _, serverMap := range []map[string]*cluster.Snode{smap.Tmap, smap.Pmap} {
-		for id, _ := range serverMap {
+	for _, serverMap := range []cluster.NodeMap{smap.Tmap, smap.Pmap} {
+		for id := range serverMap {
 			if _, ok := y.revsmap[id]; !ok {
 				count++
 			}

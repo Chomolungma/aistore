@@ -1,8 +1,7 @@
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
@@ -50,8 +49,8 @@ func newSmap() (smap *smapX) {
 }
 
 func (m *smapX) init(tsize, psize, elsize int) {
-	m.Tmap = make(map[string]*cluster.Snode, tsize)
-	m.Pmap = make(map[string]*cluster.Snode, psize)
+	m.Tmap = make(cluster.NodeMap, tsize)
+	m.Pmap = make(cluster.NodeMap, psize)
 	if elsize > 0 {
 		m.NonElects = make(cmn.SimpleKVs, elsize)
 	}
@@ -166,15 +165,30 @@ func (m *smapX) pp() string {
 
 //=====================================================================
 //
-// smapowner: implements cluster.Sowner
+// smapowner
 //
 //=====================================================================
-var _ cluster.Sowner = &smapowner{}
 
 type smapowner struct {
 	sync.Mutex
-	smap unsafe.Pointer
+	smap      unsafe.Pointer
+	listeners *smaplisteners
 }
+
+// implements cluster.Sowner
+var _ cluster.Sowner = &smapowner{}
+
+func (r *smapowner) Get() *cluster.Smap {
+	smapx := (*smapX)(atomic.LoadPointer(&r.smap))
+	return &smapx.Smap
+}
+func (r *smapowner) Listeners() cluster.SmapListeners {
+	return r.listeners
+}
+
+//
+// private to the package
+//
 
 func (r *smapowner) put(smap *smapX) {
 	for _, snode := range smap.Tmap {
@@ -184,13 +198,12 @@ func (r *smapowner) put(smap *smapX) {
 		snode.Digest()
 	}
 	atomic.StorePointer(&r.smap, unsafe.Pointer(smap))
+
+	if r.listeners != nil {
+		r.listeners.notify() // notify of Smap change all listeners (cluster.Slistener)
+	}
 }
 
-// implements cluster.Sowner.Get
-func (r *smapowner) Get() *cluster.Smap {
-	smapx := (*smapX)(atomic.LoadPointer(&r.smap))
-	return &smapx.Smap
-}
 func (r *smapowner) get() (smap *smapX) {
 	return (*smapX)(atomic.LoadPointer(&r.smap))
 }
@@ -220,16 +233,19 @@ func (r *smapowner) synchronize(newsmap *smapX, saveSmap, lesserVersionIsErr boo
 }
 
 func (r *smapowner) persist(newsmap *smapX, saveSmap bool) (errstr string) {
-	origURL := ctx.config.Proxy.PrimaryURL
-	ctx.config.Proxy.PrimaryURL = newsmap.ProxySI.PublicNet.DirectURL
-	if err := cmn.LocalSave(clivars.conffile, ctx.config); err != nil {
+	config := cmn.GCO.BeginUpdate()
+	defer cmn.GCO.CommitUpdate(config)
+
+	origURL := config.Proxy.PrimaryURL
+	config.Proxy.PrimaryURL = newsmap.ProxySI.PublicNet.DirectURL
+	if err := cmn.LocalSave(clivars.conffile, config); err != nil {
 		errstr = fmt.Sprintf("Error writing config file %s, err: %v", clivars.conffile, err)
-		ctx.config.Proxy.PrimaryURL = origURL
+		config.Proxy.PrimaryURL = origURL
 		return
 	}
 
 	if saveSmap {
-		smappathname := filepath.Join(ctx.config.Confdir, smapname)
+		smappathname := filepath.Join(config.Confdir, cmn.SmapBackupFile)
 		if err := cmn.LocalSave(smappathname, newsmap); err != nil {
 			glog.Errorf("Error writing smapX %s, err: %v", smappathname, err)
 		}
@@ -267,4 +283,60 @@ func newSnode(id, proto string, publicAddr, intraControlAddr, intraDataAddr *net
 	snode = &cluster.Snode{DaemonID: id, PublicNet: publicNet, IntraControlNet: intraControlNet, IntraDataNet: intraDataNet}
 	snode.Digest()
 	return
+}
+
+//=====================================================================
+//
+// smaplisteners: implements cluster.Listeners interface
+//
+//=====================================================================
+var _ cluster.SmapListeners = &smaplisteners{}
+
+type smaplisteners struct {
+	sync.RWMutex
+	listeners []cluster.Slistener
+}
+
+func (sls *smaplisteners) Reg(sl cluster.Slistener) {
+	sls.Lock()
+	l := len(sls.listeners)
+	for k := 0; k < l; k++ {
+		if sls.listeners[k] == sl {
+			cmn.Assert(false, fmt.Sprintf("FATAL: smap-listener %s is already registered", sl))
+		}
+		if sls.listeners[k].String() == sl.String() {
+			glog.Warningf("duplicate smap-listener %s", sl)
+		}
+	}
+	sls.listeners = append(sls.listeners, sl)
+	sls.Unlock()
+	glog.Infof("registered smap-listener %s", sl)
+}
+
+func (sls *smaplisteners) Unreg(sl cluster.Slistener) {
+	sls.Lock()
+	l := len(sls.listeners)
+	for k := 0; k < l; k++ {
+		if sls.listeners[k] == sl {
+			if k < l-1 {
+				copy(sls.listeners[k:], sls.listeners[k+1:])
+			}
+			sls.listeners[l-1] = nil
+			sls.listeners = sls.listeners[:l-1]
+			sls.Unlock()
+			glog.Infof("unregistered smap-listener %s", sl)
+			return
+		}
+	}
+	sls.Unlock()
+	cmn.Assert(false, fmt.Sprintf("FATAL: smap-listener %s is not registered", sl))
+}
+
+func (sls *smaplisteners) notify() {
+	sls.RLock()
+	l := len(sls.listeners)
+	for k := 0; k < l; k++ {
+		sls.listeners[k].SmapChanged()
+	}
+	sls.RUnlock()
 }

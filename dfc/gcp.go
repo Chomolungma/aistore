@@ -1,7 +1,7 @@
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.  *
  */
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
@@ -18,6 +18,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/json-iterator/go"
 	"google.golang.org/api/googleapi"
@@ -333,8 +334,8 @@ func (gcpimpl *gcpimpl) headobject(ct context.Context, bucket string, objname st
 // object data operations
 //
 //=======================
-func (gcpimpl *gcpimpl) getobj(ct context.Context, fqn string, bucket string, objname string) (props *objectProps, errstr string, errcode int) {
-	var v cksumvalue
+func (gcpimpl *gcpimpl) getobj(ct context.Context, fqn string, bucket string, objname string) (props *cluster.LOM, errstr string, errcode int) {
+	var v cmn.CksumValue
 	gcpclient, gctx, _, errstr := createClient(ct)
 	if errstr != "" {
 		return
@@ -346,16 +347,16 @@ func (gcpimpl *gcpimpl) getobj(ct context.Context, fqn string, bucket string, ob
 		errstr = fmt.Sprintf("Failed to retrieve %s/%s metadata, err: %v", bucket, objname, err)
 		return
 	}
-	v = newcksumvalue(attrs.Metadata[gcpDfcHashType], attrs.Metadata[gcpDfcHashVal])
+	v = cmn.NewCksum(attrs.Metadata[gcpDfcHashType], attrs.Metadata[gcpDfcHashVal])
 	md5 := hex.EncodeToString(attrs.MD5)
 	rc, err := o.NewReader(gctx)
 	if err != nil {
-		errstr = fmt.Sprintf("The object %s/%s either does not exist or is not accessible, err: %v", bucket, objname, err)
+		errstr = fmt.Sprintf("The object %s/%s either %s or is not accessible, err: %v", bucket, objname, cmn.DoesNotExist, err)
 		return
 	}
 	// hashtype and hash could be empty for legacy objects.
-	props = &objectProps{version: fmt.Sprintf("%d", attrs.Generation)}
-	if _, props.nhobj, props.size, errstr = gcpimpl.t.receive(fqn, objname, md5, v, rc); errstr != "" {
+	props = &cluster.LOM{T: gcpimpl.t, Bucket: bucket, Objname: objname, Nhobj: v, Version: fmt.Sprintf("%d", attrs.Generation)}
+	if _, props.Nhobj, props.Size, errstr = gcpimpl.t.receive(fqn, props, md5, rc); errstr != "" {
 		rc.Close()
 		return
 	}
@@ -366,7 +367,7 @@ func (gcpimpl *gcpimpl) getobj(ct context.Context, fqn string, bucket string, ob
 	return
 }
 
-func (gcpimpl *gcpimpl) putobj(ct context.Context, file *os.File, bucket, objname string, ohash cksumvalue) (version string, errstr string, errcode int) {
+func (gcpimpl *gcpimpl) putobj(ct context.Context, file *os.File, bucket, objname string, ohash cmn.CksumValue) (version string, errstr string, errcode int) {
 	var (
 		htype, hval string
 		md          cmn.SimpleKVs
@@ -376,7 +377,7 @@ func (gcpimpl *gcpimpl) putobj(ct context.Context, file *os.File, bucket, objnam
 		return
 	}
 	if ohash != nil {
-		htype, hval = ohash.get()
+		htype, hval = ohash.Get()
 		md = make(cmn.SimpleKVs)
 		md[gcpDfcHashType] = htype
 		md[gcpDfcHashVal] = hval

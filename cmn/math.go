@@ -1,9 +1,7 @@
+// Package cmn provides common low-level types and utilities for all dfcpub projects
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-
-// Package cmn provides common low-level types and utilities for all dfcpub projects
 package cmn
 
 import "math"
@@ -66,6 +64,20 @@ func MinF64(a, b float64) float64 {
 }
 
 func MaxF64(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func MinF32(a, b float32) float32 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func MaxF32(a, b float32) float32 {
 	if a > b {
 		return a
 	}

@@ -1,8 +1,7 @@
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
@@ -37,12 +36,12 @@ type bucketMD struct {
 
 // c-tor
 func newBucketMD() *bucketMD {
-	lbmap := make(map[string]cmn.BucketProps)
-	cbmap := make(map[string]cmn.BucketProps)
+	lbmap := make(map[string]*cmn.BucketProps)
+	cbmap := make(map[string]*cmn.BucketProps)
 	return &bucketMD{cluster.BMD{LBmap: lbmap, CBmap: cbmap}, ""}
 }
 
-func (m *bucketMD) add(b string, local bool, p cmn.BucketProps) bool {
+func (m *bucketMD) add(b string, local bool, p *cmn.BucketProps) bool {
 	mm := m.LBmap
 	if !local {
 		mm = m.CBmap
@@ -68,16 +67,7 @@ func (m *bucketMD) del(b string, local bool) bool {
 	return true
 }
 
-func (m *bucketMD) get(b string, local bool) (bool, cmn.BucketProps) {
-	mm := m.LBmap
-	if !local {
-		mm = m.CBmap
-	}
-	p, ok := mm[b]
-	return ok, p
-}
-
-func (m *bucketMD) set(b string, local bool, p cmn.BucketProps) {
+func (m *bucketMD) set(b string, local bool, p *cmn.BucketProps) {
 	mm := m.LBmap
 	if !local {
 		mm = m.CBmap
@@ -90,28 +80,13 @@ func (m *bucketMD) set(b string, local bool, p cmn.BucketProps) {
 	mm[b] = p
 }
 
-func (m *bucketMD) islocal(bucket string) bool {
-	_, ok := m.LBmap[bucket]
-	return ok
-}
-
-func (m *bucketMD) propsAndChecksum(bucket string) (p cmn.BucketProps, checksum string, defined bool) {
+func (m *bucketMD) propsAndChecksum(bucket string) (p *cmn.BucketProps, checksum string, defined bool) {
 	var ok bool
-	ok, p = m.get(bucket, m.islocal(bucket))
+	p, ok = m.Get(bucket, m.IsLocal(bucket))
 	if !ok || p.Checksum == cmn.ChecksumInherit {
 		return p, "", false
 	}
 	return p, p.Checksum, true
-}
-
-// lruEnabled returns whether or not LRU is enabled
-// for the bucket. Returns the global setting if bucket not found
-func (m *bucketMD) lruEnabled(bucket string) bool {
-	ok, p := m.get(bucket, m.islocal(bucket))
-	if !ok {
-		return ctx.config.LRU.LRUEnabled
-	}
-	return p.LRUEnabled
 }
 
 func (m *bucketMD) clone() *bucketMD {
@@ -122,14 +97,16 @@ func (m *bucketMD) clone() *bucketMD {
 
 func (m *bucketMD) deepcopy(dst *bucketMD) {
 	cmn.CopyStruct(dst, m)
-	dst.LBmap = make(map[string]cmn.BucketProps, len(m.LBmap))
-	dst.CBmap = make(map[string]cmn.BucketProps, len(m.CBmap))
-	inmaps := [2]map[string]cmn.BucketProps{m.LBmap, m.CBmap}
-	outmaps := [2]map[string]cmn.BucketProps{dst.LBmap, dst.CBmap}
+	dst.LBmap = make(map[string]*cmn.BucketProps, len(m.LBmap))
+	dst.CBmap = make(map[string]*cmn.BucketProps, len(m.CBmap))
+	inmaps := [2]map[string]*cmn.BucketProps{m.LBmap, m.CBmap}
+	outmaps := [2]map[string]*cmn.BucketProps{dst.LBmap, dst.CBmap}
 	for i := 0; i < len(inmaps); i++ {
 		mm := outmaps[i]
 		for name, props := range inmaps[i] {
-			mm[name] = props
+			p := &cmn.BucketProps{}
+			*p = *props
+			mm[name] = p
 		}
 	}
 }

@@ -1,14 +1,14 @@
+// Package cluster provides common interfaces and local access to cluster-level metadata
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package cluster provides local access to cluster-level metadata
 package cluster
 
 import (
 	"fmt"
 	"reflect"
 
+	"github.com/NVIDIA/dfcpub/3rdparty/glog"
 	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/OneOfOne/xxhash"
 )
@@ -17,6 +17,7 @@ import (
 // (for implementation, see dfc/clustermap.go)
 type Sowner interface {
 	Get() (smap *Smap)
+	Listeners() SmapListeners
 }
 
 // NetInfo
@@ -33,9 +34,9 @@ type NetInfo struct {
 //==================================================================
 type Snode struct {
 	DaemonID        string  `json:"daemon_id"`
-	PublicNet       NetInfo `json:"public_net"`
-	IntraControlNet NetInfo `json:"intra_control_net"`
-	IntraDataNet    NetInfo `json:"intra_data_net"`
+	PublicNet       NetInfo `json:"public_net"`        // cmn.NetworkPublic
+	IntraControlNet NetInfo `json:"intra_control_net"` // cmn.NetworkIntraControl
+	IntraDataNet    NetInfo `json:"intra_data_net"`    // cmn.NetworkIntraData
 	idDigest        uint64
 }
 
@@ -46,9 +47,27 @@ func (d *Snode) Digest() uint64 {
 	return d.idDigest
 }
 
+const snodefmt = "[\n\tDaemonID: %s,\n\tPublicNet: %s,\n\tIntraControl: %s,\n\tIntraData: %s,\n\tidDigest: %d]"
+
 func (d *Snode) String() string {
-	f := "[\n\tDaemonID: %s,\n\tPublicNet: %s,\n\tIntraControlNet: %s,\n\tIntraDataNet: %s,\n\tidDigest: %d]"
-	return fmt.Sprintf(f, d.DaemonID, d.PublicNet.DirectURL, d.IntraControlNet.DirectURL, d.IntraDataNet.DirectURL, d.idDigest)
+	if glog.V(4) {
+		return fmt.Sprintf(snodefmt, d.DaemonID, d.PublicNet.DirectURL, d.IntraControlNet.DirectURL, d.IntraDataNet.DirectURL, d.idDigest)
+	}
+	return d.DaemonID
+}
+
+func (d *Snode) URL(network string) string {
+	switch network {
+	case cmn.NetworkPublic:
+		return d.PublicNet.DirectURL
+	case cmn.NetworkIntraControl:
+		return d.IntraControlNet.DirectURL
+	case cmn.NetworkIntraData:
+		return d.IntraDataNet.DirectURL
+	default:
+		cmn.Assert(false, "unknown network '"+network+"'")
+		return ""
+	}
 }
 
 func (a *Snode) Equals(b *Snode) bool {
@@ -66,13 +85,17 @@ func (a *Snode) Equals(b *Snode) bool {
 // Smap uniquely and solely defines the primary proxy
 //
 //===============================================================
-type Smap struct {
-	Tmap      map[string]*Snode `json:"tmap"` // daemonID -> Snode
-	Pmap      map[string]*Snode `json:"pmap"` // proxyID -> proxyInfo
-	NonElects cmn.SimpleKVs     `json:"non_electable"`
-	ProxySI   *Snode            `json:"proxy_si"`
-	Version   int64             `json:"version"`
-}
+type (
+	NodeMap map[string]*Snode
+
+	Smap struct {
+		Tmap      NodeMap       `json:"tmap"` // daemonID -> Snode
+		Pmap      NodeMap       `json:"pmap"` // proxyID -> proxyInfo
+		NonElects cmn.SimpleKVs `json:"non_electable"`
+		ProxySI   *Snode        `json:"proxy_si"`
+		Version   int64         `json:"version"`
+	}
+)
 
 func (m *Smap) CountTargets() int { return len(m.Tmap) }
 func (m *Smap) CountProxies() int { return len(m.Pmap) }
@@ -105,7 +128,7 @@ func (a *Smap) Equals(b *Smap) bool {
 	}
 	return mapsEq(a.Tmap, b.Tmap) && mapsEq(a.Pmap, b.Pmap)
 }
-func mapsEq(a, b map[string]*Snode) bool {
+func mapsEq(a, b NodeMap) bool {
 	if len(a) != len(b) {
 		return false
 	}
@@ -118,3 +141,45 @@ func mapsEq(a, b map[string]*Snode) bool {
 	}
 	return true
 }
+
+//
+// helper to find out Smap "delta" in terms of targets and proxies, added and removed
+// can be used as destination selectors - see the DestSelector typedef
+//
+
+func nodeMapDelta(old, new []NodeMap) (added, removed NodeMap) {
+	added, removed = make(NodeMap), make(NodeMap)
+	for i, mold := range old {
+		mnew := new[i]
+		for id, si := range mnew {
+			if _, ok := mold[id]; !ok {
+				added[id] = si
+			}
+		}
+	}
+	for i, mold := range old {
+		mnew := new[i]
+		for id, si := range mold {
+			if _, ok := mnew[id]; !ok {
+				removed[id] = si
+			}
+		}
+	}
+	return
+}
+
+//==================================================================
+//
+// minimal smap-update listening frame
+//
+//==================================================================
+type (
+	Slistener interface {
+		SmapChanged()
+		String() string
+	}
+	SmapListeners interface {
+		Reg(sl Slistener)
+		Unreg(sl Slistener)
+	}
+)

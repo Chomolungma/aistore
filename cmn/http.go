@@ -1,14 +1,16 @@
+// Package cmn provides common low-level types and utilities for all dfcpub projects
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-
-// Package cmn provides common low-level types and utilities for all dfcpub projects
 package cmn
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"html"
+	"io"
+	"io/ioutil"
 	"net/http"
 	"path"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/NVIDIA/dfcpub/3rdparty/glog"
+	jsoniter "github.com/json-iterator/go"
 )
 
 // URLPath returns a HTTP URL path by joining all segments with "/"
@@ -99,7 +102,7 @@ func InvalidHandlerWithMsg(w http.ResponseWriter, r *http.Request, msg string, e
 // InvalidHandlerDetailed writes detailed error (includes line and file) to response writer.
 func InvalidHandlerDetailed(w http.ResponseWriter, r *http.Request, msg string, errCode ...int) {
 	status := http.StatusBadRequest
-	if len(errCode) > 0 {
+	if len(errCode) > 0 && errCode[0] >= http.StatusBadRequest {
 		status = errCode[0]
 	}
 	errMsg := ErrHTTP(r, msg, status)
@@ -120,4 +123,53 @@ func InvalidHandlerDetailed(w http.ResponseWriter, r *http.Request, msg string, 
 
 	glog.Errorln(errMsg)
 	http.Error(w, errMsg, status)
+}
+
+func ReadJSON(w http.ResponseWriter, r *http.Request, out interface{}) error {
+	getErrorLine := func() string {
+		if _, file, line, ok := runtime.Caller(2); ok {
+			f := filepath.Base(file)
+			return fmt.Sprintf("(%s, #%d)", f, line)
+		}
+		return ""
+	}
+
+	b, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		s := fmt.Sprintf("Failed to read %s request, err: %v", r.Method, err)
+		if err == io.EOF {
+			trailer := r.Trailer.Get("Error")
+			if trailer != "" {
+				s = fmt.Sprintf("Failed to read %s request, err: %v, trailer: %s", r.Method, err, trailer)
+			}
+		}
+		s += getErrorLine()
+
+		InvalidHandlerDetailed(w, r, s)
+		return err
+	}
+
+	err = jsoniter.Unmarshal(b, out)
+	if err != nil {
+		s := fmt.Sprintf("Failed to json-unmarshal %s request, err: %v [%v]", r.Method, err, string(b))
+		s += getErrorLine()
+
+		InvalidHandlerDetailed(w, r, s)
+		return err
+	}
+	return nil
+}
+
+// ReqWithContext executes request with ability to cancel it.
+func ReqWithContext(method, url string, body []byte) (*http.Request, context.Context, context.CancelFunc, error) {
+	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if method == http.MethodPost || method == http.MethodPut {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	req = req.WithContext(ctx)
+	return req, ctx, cancel, nil
 }

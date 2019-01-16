@@ -15,6 +15,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -27,7 +28,9 @@ import (
 	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/dfc"
+	"github.com/NVIDIA/dfcpub/fs"
 	"github.com/NVIDIA/dfcpub/memsys"
+	"github.com/NVIDIA/dfcpub/stats"
 	"github.com/NVIDIA/dfcpub/tutils"
 	"github.com/json-iterator/go"
 )
@@ -55,7 +58,6 @@ const (
 )
 
 var (
-	RenameMsg        = cmn.ActionMsg{Action: cmn.ActRename}
 	HighWaterMark    = uint32(80)
 	LowWaterMark     = uint32(60)
 	UpdTime          = time.Second * 20
@@ -73,7 +75,6 @@ func TestLocalListBucketGetTargetURL(t *testing.T) {
 	const (
 		num      = 1000
 		filesize = 1024
-		seed     = int64(111)
 		bucket   = TestLocalBucketName
 	)
 	var (
@@ -83,9 +84,7 @@ func TestLocalListBucketGetTargetURL(t *testing.T) {
 		targets    = make(map[string]struct{})
 		proxyURL   = getPrimaryURL(t, proxyURLRO)
 	)
-
-	smap, err := tutils.GetClusterMap(proxyURL)
-	tutils.CheckFatal(err, t)
+	smap := getClusterMap(t, proxyURL)
 	if len(smap.Tmap) == 1 {
 		tutils.Logln("Warning: more than 1 target should deployed for best utility of this test.")
 	}
@@ -98,13 +97,13 @@ func TestLocalListBucketGetTargetURL(t *testing.T) {
 	createFreshLocalBucket(t, proxyURL, bucket)
 	defer destroyLocalBucket(t, proxyURL, bucket)
 
-	putRandObjs(proxyURL, seed, filesize, num, bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(proxyURL, bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, true)
 	close(filenameCh)
 	close(errCh)
 
 	msg := &cmn.GetMsg{GetPageSize: int(pagesize), GetProps: cmn.GetTargetURL}
-	bl, err := tutils.ListBucket(proxyURL, bucket, msg, num)
+	bl, err := api.ListBucket(tutils.DefaultBaseAPIParams(t), bucket, msg, num)
 	tutils.CheckFatal(err, t)
 
 	if len(bl.Entries) != num {
@@ -118,7 +117,8 @@ func TestLocalListBucketGetTargetURL(t *testing.T) {
 		if _, ok := targets[e.TargetURL]; !ok {
 			targets[e.TargetURL] = struct{}{}
 		}
-		l, _, err := tutils.Get(e.TargetURL, bucket, e.Name, nil, nil, false, false)
+		baseParams := tutils.BaseAPIParams(e.TargetURL)
+		l, err := api.GetObject(baseParams, bucket, e.Name)
 		tutils.CheckFatal(err, t)
 		if uint64(l) != filesize {
 			t.Errorf("Expected filesize: %d, actual filesize: %d\n", filesize, l)
@@ -131,7 +131,7 @@ func TestLocalListBucketGetTargetURL(t *testing.T) {
 
 	// Ensure no target URLs are returned when the property is not requested
 	msg.GetProps = ""
-	bl, err = tutils.ListBucket(proxyURL, bucket, msg, num)
+	bl, err = api.ListBucket(tutils.DefaultBaseAPIParams(t), bucket, msg, num)
 	tutils.CheckFatal(err, t)
 
 	if len(bl.Entries) != num {
@@ -149,12 +149,7 @@ func TestCloudListBucketGetTargetURL(t *testing.T) {
 	const (
 		numberOfFiles = 100
 		fileSize      = 1024
-		seed          = int64(111)
 	)
-
-	proxyURL := getPrimaryURL(t, proxyURLRO)
-	random := rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
-	prefix := tutils.FastRandomFilename(random, 32)
 
 	var (
 		fileNameCh = make(chan string, numberOfFiles)
@@ -162,15 +157,16 @@ func TestCloudListBucketGetTargetURL(t *testing.T) {
 		sgl        *memsys.SGL
 		bucketName = clibucket
 		targets    = make(map[string]struct{})
+		proxyURL   = getPrimaryURL(t, proxyURLRO)
+		random     = rand.New(rand.NewSource(time.Now().UTC().UnixNano()))
+		prefix     = tutils.FastRandomFilename(random, 32)
 	)
 
 	if !isCloudBucket(t, proxyURL, clibucket) {
 		t.Skip("TestCloudListBucketGetTargetURL requires a cloud bucket")
 	}
-
-	clusterMap, err := tutils.GetClusterMap(proxyURL)
-	tutils.CheckFatal(err, t)
-	if len(clusterMap.Tmap) == 1 {
+	smap := getClusterMap(t, proxyURL)
+	if len(smap.Tmap) == 1 {
 		tutils.Logln("Warning: more than 1 target should deployed for best utility of this test.")
 	}
 
@@ -178,14 +174,14 @@ func TestCloudListBucketGetTargetURL(t *testing.T) {
 		sgl = tutils.Mem2.NewSGL(fileSize)
 		defer sgl.Free()
 	}
-	putRandObjs(proxyURL, seed, fileSize, numberOfFiles, bucketName, errCh, fileNameCh, SmokeDir, prefix, true, sgl)
+	tutils.PutRandObjs(proxyURL, bucketName, SmokeDir, readerType, prefix, fileSize, numberOfFiles, errCh, fileNameCh, sgl)
 	selectErr(errCh, "put", t, true)
 	close(fileNameCh)
 	close(errCh)
 	defer func() {
 		files := make([]string, numberOfFiles)
 		for i := 0; i < numberOfFiles; i++ {
-			files[i] = prefix + "/" + <-fileNameCh
+			files[i] = path.Join(prefix, <-fileNameCh)
 		}
 		err := tutils.DeleteList(proxyURL, bucketName, files, true, 0)
 		if err != nil {
@@ -194,7 +190,7 @@ func TestCloudListBucketGetTargetURL(t *testing.T) {
 	}()
 
 	listBucketMsg := &cmn.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize), GetProps: cmn.GetTargetURL}
-	bucketList, err := tutils.ListBucket(proxyURL, bucketName, listBucketMsg, 0)
+	bucketList, err := api.ListBucket(tutils.DefaultBaseAPIParams(t), bucketName, listBucketMsg, 0)
 	tutils.CheckFatal(err, t)
 
 	if len(bucketList.Entries) != numberOfFiles {
@@ -209,8 +205,8 @@ func TestCloudListBucketGetTargetURL(t *testing.T) {
 		if _, ok := targets[object.TargetURL]; !ok {
 			targets[object.TargetURL] = struct{}{}
 		}
-		objectSize, _, err := tutils.Get(object.TargetURL, bucketName, object.Name,
-			nil, nil, false, false)
+		baseParams := tutils.BaseAPIParams(object.TargetURL)
+		objectSize, err := api.GetObject(baseParams, bucketName, object.Name)
 		tutils.CheckFatal(err, t)
 		if uint64(objectSize) != fileSize {
 			t.Errorf("Expected fileSize: %d, actual fileSize: %d\n", fileSize, objectSize)
@@ -218,14 +214,14 @@ func TestCloudListBucketGetTargetURL(t *testing.T) {
 	}
 
 	// The objects should have been distributed to all targets
-	if len(clusterMap.Tmap) != len(targets) {
+	if len(smap.Tmap) != len(targets) {
 		t.Errorf("Expected %d different target URLs, actual: %d different target URLs",
-			len(clusterMap.Tmap), len(targets))
+			len(smap.Tmap), len(targets))
 	}
 
 	// Ensure no target URLs are returned when the property is not requested
 	listBucketMsg.GetProps = ""
-	bucketList, err = tutils.ListBucket(proxyURL, bucketName, listBucketMsg, 0)
+	bucketList, err = api.ListBucket(tutils.DefaultBaseAPIParams(t), bucketName, listBucketMsg, 0)
 	tutils.CheckFatal(err, t)
 
 	if len(bucketList.Entries) != numberOfFiles {
@@ -249,10 +245,13 @@ func TestGetCorruptFileAfterPut(t *testing.T) {
 		filenameCh = make(chan string, num)
 		errCh      = make(chan error, 100)
 		sgl        *memsys.SGL
-		seed       = int64(111)
 		fqn        string
 		proxyURL   = getPrimaryURL(t, proxyURLRO)
 	)
+	if tutils.DockerRunning() {
+		t.Skip(fmt.Sprintf("%q requires setting Xattrs, doesn't work with docker", t.Name()))
+	}
+
 	bucket := TestLocalBucketName
 	createFreshLocalBucket(t, proxyURL, bucket)
 	defer destroyLocalBucket(t, proxyURL, bucket)
@@ -262,7 +261,7 @@ func TestGetCorruptFileAfterPut(t *testing.T) {
 		defer sgl.Free()
 	}
 
-	putRandObjs(proxyURL, seed, filesize, num, bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(proxyURL, bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -286,7 +285,7 @@ func TestGetCorruptFileAfterPut(t *testing.T) {
 	tutils.Logf("Corrupting file data[%s]: %s\n", fName, fqn)
 	err := ioutil.WriteFile(fqn, []byte("this file has been corrupted"), 0644)
 	tutils.CheckFatal(err, t)
-	_, _, err = tutils.Get(proxyURL, bucket, SmokeStr+"/"+fName, nil, nil, false, true)
+	_, err = api.GetObjectWithValidation(tutils.DefaultBaseAPIParams(t), bucket, path.Join(SmokeStr, fName))
 	if err == nil {
 		t.Error("Error is nil, expected non-nil error on a a GET for an object with corrupted contents")
 	}
@@ -295,10 +294,10 @@ func TestGetCorruptFileAfterPut(t *testing.T) {
 	fName = <-filenameCh
 	filepath.Walk(rootDir, fsWalkFunc)
 	tutils.Logf("Corrupting file xattr[%s]: %s\n", fName, fqn)
-	if errstr := dfc.Setxattr(fqn, cmn.XattrXXHashVal, []byte("01234abcde")); errstr != "" {
+	if errstr := fs.SetXattr(fqn, cmn.XattrXXHashVal, []byte("01234abcde")); errstr != "" {
 		t.Error(errstr)
 	}
-	_, _, err = tutils.Get(proxyURL, bucket, SmokeStr+"/"+fName, nil, nil, false, true)
+	_, err = api.GetObjectWithValidation(tutils.DefaultBaseAPIParams(t), bucket, path.Join(SmokeStr, fName))
 	if err == nil {
 		t.Error("Error is nil, expected non-nil error on a GET for an object with corrupted xattr")
 	}
@@ -317,14 +316,17 @@ func TestRenameLocalBuckets(t *testing.T) {
 	if testing.Short() {
 		t.Skip(skipping)
 	}
-	proxyURL := getPrimaryURL(t, proxyURLRO)
-	bucket := TestLocalBucketName
-	renamedBucket := bucket + "_renamed"
+	var (
+		proxyURL      = getPrimaryURL(t, proxyURLRO)
+		bucket        = TestLocalBucketName
+		renamedBucket = bucket + "_renamed"
+	)
+
 	createFreshLocalBucket(t, proxyURL, bucket)
 	destroyLocalBucket(t, proxyURL, renamedBucket)
 	defer destroyLocalBucket(t, proxyURL, renamedBucket)
 
-	b, err := api.GetBucketNames(tutils.HTTPClient, proxyURL, true)
+	b, err := api.GetBucketNames(tutils.DefaultBaseAPIParams(t), true)
 	tutils.CheckFatal(err, t)
 
 	doBucketRegressionTest(t, proxyURL, regressionTestData{
@@ -338,7 +340,6 @@ func TestListObjects(t *testing.T) {
 		numFiles   = 20
 		prefix     = "regressionList"
 		bucket     = clibucket
-		seed       = baseseed + 101
 		errCh      = make(chan error, numFiles*5)
 		filesPutCh = make(chan string, numfiles)
 		dir        = DeleteDir
@@ -358,7 +359,7 @@ func TestListObjects(t *testing.T) {
 		fname := fmt.Sprintf("obj%d", i+1)
 		fileList = append(fileList, fname)
 	}
-	putRandObjsFromList(proxyURL, seed, fileSize, fileList, bucket, errCh, filesPutCh, dir, prefix, !testing.Verbose(), sgl)
+	tutils.PutObjsFromList(proxyURL, bucket, dir, readerType, prefix, fileSize, fileList, errCh, filesPutCh, sgl)
 	close(filesPutCh)
 	selectErr(errCh, "list - put", t, true /* fatal - if PUT does not work then it makes no sense to continue */)
 	close(errCh)
@@ -418,7 +419,7 @@ func TestListObjects(t *testing.T) {
 
 	if usingFile {
 		for name := range filesPutCh {
-			os.Remove(dir + "/" + name)
+			os.Remove(filepath.Join(dir, name))
 		}
 	}
 }
@@ -428,15 +429,14 @@ func TestRenameObjects(t *testing.T) {
 		t.Skip(skipping)
 	}
 	var (
-		injson     []byte
-		err        error
-		numPuts    = 10
-		filesPutCh = make(chan string, numPuts)
-		errCh      = make(chan error, numPuts)
-		basenames  = make([]string, 0, numPuts) // basenames
-		bnewnames  = make([]string, 0, numPuts) // new basenames
-		sgl        *memsys.SGL
-		proxyURL   = getPrimaryURL(t, proxyURLRO)
+		err       error
+		numPuts   = 10
+		objsPutCh = make(chan string, numPuts)
+		errCh     = make(chan error, numPuts)
+		basenames = make([]string, 0, numPuts) // basenames
+		bnewnames = make([]string, 0, numPuts) // new basenames
+		sgl       *memsys.SGL
+		proxyURL  = getPrimaryURL(t, proxyURLRO)
 	)
 
 	createFreshLocalBucket(t, proxyURL, RenameLocalBucketName)
@@ -444,14 +444,14 @@ func TestRenameObjects(t *testing.T) {
 	defer func() {
 		// cleanup
 		wg := &sync.WaitGroup{}
-		for _, fname := range bnewnames {
+		for _, newObj := range bnewnames {
 			wg.Add(1)
-			go tutils.Del(proxyURL, RenameLocalBucketName, RenameStr+"/"+fname, wg, errCh, !testing.Verbose())
+			go tutils.Del(proxyURL, RenameLocalBucketName, newObj, wg, errCh, !testing.Verbose())
 		}
 
 		if usingFile {
 			for _, fname := range basenames {
-				err = os.Remove(RenameDir + "/" + fname)
+				err = os.Remove(path.Join(RenameDir, fname))
 				if err != nil {
 					t.Errorf("Failed to remove file %s: %v", fname, err)
 				}
@@ -475,36 +475,31 @@ func TestRenameObjects(t *testing.T) {
 		defer sgl.Free()
 	}
 
-	putRandObjs(proxyURL, baseseed+1, 0, numPuts, RenameLocalBucketName, errCh, filesPutCh, RenameDir,
-		RenameStr, !testing.Verbose(), sgl)
+	tutils.PutRandObjs(proxyURL, RenameLocalBucketName, RenameDir, readerType, RenameStr, 0, numPuts, errCh, objsPutCh, sgl)
 	selectErr(errCh, "put", t, false)
-	close(filesPutCh)
-	for fname := range filesPutCh {
+	close(objsPutCh)
+	for fname := range objsPutCh {
 		basenames = append(basenames, fname)
 	}
 
 	// rename
 	for _, fname := range basenames {
-		RenameMsg.Name = RenameStr + "/" + fname + ".renamed" // objname
-		bnewnames = append(bnewnames, fname+".renamed")       // base name
-		injson, err = jsoniter.Marshal(RenameMsg)
-		if err != nil {
-			t.Fatalf("Failed to marshal RenameMsg: %v", err)
+		oldObj := path.Join(RenameStr, fname)
+		newObj := oldObj + ".renamed" // objname fqn
+		bnewnames = append(bnewnames, newObj)
+		if err := api.RenameObject(tutils.DefaultBaseAPIParams(t), RenameLocalBucketName, oldObj, newObj); err != nil {
+			t.Fatalf("Failed to rename object from %s => %s, err: %v", oldObj, newObj, err)
 		}
-
-		url := proxyURL + cmn.URLPath(cmn.Version, cmn.Objects, RenameLocalBucketName, RenameStr, fname)
-		if err := tutils.HTTPRequest(http.MethodPost, url, tutils.NewBytesReader(injson)); err != nil {
-			t.Fatalf("Failed to send request, err = %v", err)
-		}
-
-		tutils.Logln(fmt.Sprintf("Rename %s/%s => %s", RenameStr, fname, RenameMsg.Name))
+		tutils.Logln(fmt.Sprintf("Rename %s => %s successful", oldObj, newObj))
 	}
 
 	// get renamed objects
 	waitProgressBar("Rename/move: ", time.Second*5)
-	for _, fname := range bnewnames {
-		tutils.Get(proxyURL, RenameLocalBucketName, RenameStr+"/"+fname, nil,
-			errCh, !testing.Verbose(), false /* validate */)
+	for _, newObj := range bnewnames {
+		_, err := api.GetObject(tutils.DefaultBaseAPIParams(t), RenameLocalBucketName, newObj)
+		if err != nil {
+			errCh <- err
+		}
 	}
 	selectErr(errCh, "get", t, false)
 }
@@ -540,24 +535,23 @@ func TestRebalance(t *testing.T) {
 	}
 	const filesize = 1024 * 128
 	var (
-		sid             string
-		targetDirectURL string
-		numPuts         = 40
-		filesPutCh      = make(chan string, numPuts)
-		errCh           = make(chan error, 100)
-		wg              = &sync.WaitGroup{}
-		sgl             *memsys.SGL
-		proxyURL        = getPrimaryURL(t, proxyURLRO)
+		randomTarget *cluster.Snode
+		numPuts      = 40
+		filesPutCh   = make(chan string, numPuts)
+		errCh        = make(chan error, 100)
+		wg           = &sync.WaitGroup{}
+		sgl          *memsys.SGL
+		proxyURL     = getPrimaryURL(t, proxyURLRO)
 	)
 	filesSentOrig := make(map[string]int64)
 	bytesSentOrig := make(map[string]int64)
 	filesRecvOrig := make(map[string]int64)
 	bytesRecvOrig := make(map[string]int64)
 	stats := getClusterStats(t, proxyURL)
-	for k, v := range stats.Target {
+	for k, v := range stats.Target { // FIXME: stats names => API package
 		bytesSentOrig[k], filesSentOrig[k], bytesRecvOrig[k], filesRecvOrig[k] =
-			v.Core.Tracker["tx.size"].Value, v.Core.Tracker["tx.n"].Value,
-			v.Core.Tracker["rx.size"].Value, v.Core.Tracker["rx.n"].Value
+			getNamedTargetStats(v, "tx.size"), getNamedTargetStats(v, "tx.n"),
+			getNamedTargetStats(v, "rx.size"), getNamedTargetStats(v, "rx.n")
 	}
 
 	//
@@ -580,14 +574,11 @@ func TestRebalance(t *testing.T) {
 	if l < 2 {
 		t.Fatalf("Must have 2 or more targets in the cluster, have only %d", l)
 	}
-	for sid = range smap.Tmap {
-		break
-	}
-	targetDirectURL = smap.Tmap[sid].PublicNet.DirectURL
+	randomTarget = extractTargetNodes(smap)[0]
 
-	err := tutils.UnregisterTarget(proxyURL, sid)
+	err := tutils.UnregisterTarget(proxyURL, randomTarget.DaemonID)
 	tutils.CheckFatal(err, t)
-	tutils.Logf("Unregistered %s: cluster size = %d (targets)\n", sid, l-1)
+	tutils.Logf("Unregistered %s: cluster size = %d (targets)\n", randomTarget.DaemonID, l-1)
 	//
 	// step 3. put random files => (cluster - 1)
 	//
@@ -595,14 +586,13 @@ func TestRebalance(t *testing.T) {
 		sgl = tutils.Mem2.NewSGL(filesize)
 		defer sgl.Free()
 	}
-	putRandObjs(proxyURL, baseseed, filesize, numPuts, clibucket, errCh, filesPutCh, SmokeDir,
-		SmokeStr, !testing.Verbose(), sgl)
+	tutils.PutRandObjs(proxyURL, clibucket, SmokeDir, readerType, SmokeStr, filesize, numPuts, errCh, filesPutCh, sgl)
 	selectErr(errCh, "put", t, false)
 
 	//
 	// step 4. register back
 	//
-	err = tutils.RegisterTarget(sid, targetDirectURL, smap)
+	err = tutils.RegisterTarget(proxyURL, randomTarget, smap)
 	tutils.CheckFatal(err, t)
 	for i := 0; i < 25; i++ {
 		time.Sleep(time.Second)
@@ -612,10 +602,10 @@ func TestRebalance(t *testing.T) {
 		}
 	}
 	if len(smap.Tmap) != l {
-		t.Errorf("Re-registration timed out: target %s, original num targets %d\n", sid, l)
+		t.Errorf("Re-registration timed out: target %s, original num targets %d\n", randomTarget.DaemonID, l)
 		return
 	}
-	tutils.Logf("Re-registered %s: the cluster is now back to %d targets\n", sid, l)
+	tutils.Logf("Re-registered %s: the cluster is now back to %d targets\n", randomTarget.DaemonID, l)
 	//
 	// step 5. wait for rebalance to run its course
 	//
@@ -625,11 +615,11 @@ func TestRebalance(t *testing.T) {
 	//
 	stats = getClusterStats(t, proxyURL)
 	var bsent, fsent, brecv, frecv int64
-	for k, v := range stats.Target {
-		bsent += v.Core.Tracker["tx.size"].Value - bytesSentOrig[k]
-		fsent += v.Core.Tracker["tx.n"].Value - filesSentOrig[k]
-		brecv += v.Core.Tracker["rx.size"].Value - bytesRecvOrig[k]
-		frecv += v.Core.Tracker["rx.n"].Value - filesRecvOrig[k]
+	for k, v := range stats.Target { // FIXME: stats names => API package
+		bsent += getNamedTargetStats(v, "tx.size") - bytesSentOrig[k]
+		fsent += getNamedTargetStats(v, "tx.n") - filesSentOrig[k]
+		brecv += getNamedTargetStats(v, "rx.size") - bytesRecvOrig[k]
+		frecv += getNamedTargetStats(v, "rx.n") - filesRecvOrig[k]
 	}
 
 	//
@@ -638,7 +628,7 @@ func TestRebalance(t *testing.T) {
 	close(filesPutCh) // to exit for-range
 	for fname := range filesPutCh {
 		if usingFile {
-			err := os.Remove(SmokeDir + "/" + fname)
+			err := os.Remove(path.Join(SmokeDir, fname))
 			if err != nil {
 				t.Error(err)
 			}
@@ -679,12 +669,12 @@ func TestGetClusterStats(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Could not decode Target Stats: fstats.Usedpct")
 			}
-			if uint64(used) != fstats.Used || uint64(avail) != fstats.Avail || uint32(usedpct) != fstats.Usedpct {
+			if used != int64(fstats.Used) || avail != int64(fstats.Avail) || usedpct != fstats.Usedpct {
 				t.Errorf("Stats are different when queried from Target and Proxy: "+
 					"Used: %v, %v | Available:  %v, %v | Percentage: %v, %v",
 					tfstats["used"], fstats.Used, tfstats["avail"], fstats.Avail, tfstats["usedpct"], fstats.Usedpct)
 			}
-			if fstats.Usedpct > HighWaterMark {
+			if fstats.Usedpct > int64(HighWaterMark) {
 				t.Error("Used Percentage above High Watermark")
 			}
 		}
@@ -693,65 +683,60 @@ func TestGetClusterStats(t *testing.T) {
 
 func TestConfig(t *testing.T) {
 	proxyURL := getPrimaryURL(t, proxyURLRO)
-	oconfig := getConfig(proxyURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
-	olruconfig := oconfig["lru_config"].(map[string]interface{})
-	operiodic := oconfig["periodic"].(map[string]interface{})
+	oconfig := getDaemonConfig(t, proxyURL)
+	olruconfig := oconfig.LRU
+	operiodic := oconfig.Periodic
 
 	for k, v := range configRegression {
-		setConfig(k, v, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setClusterConfig(t, proxyURL, k, v)
 	}
 
-	nconfig := getConfig(proxyURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
-	nlruconfig := nconfig["lru_config"].(map[string]interface{})
-	nperiodic := nconfig["periodic"].(map[string]interface{})
+	nconfig := getDaemonConfig(t, proxyURL)
+	nlruconfig := nconfig.LRU
+	nperiodic := nconfig.Periodic
 
-	if nperiodic["stats_time"] != configRegression["stats_time"] {
+	if nperiodic.StatsTimeStr != configRegression["stats_time"] {
 		t.Errorf("StatsTime was not set properly: %v, should be: %v",
-			nperiodic["stats_time"], configRegression["stats_time"])
+			nperiodic.StatsTimeStr, configRegression["stats_time"])
 	} else {
-		o := operiodic["stats_time"].(string)
-		setConfig("stats_time", o, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		o := operiodic.StatsTimeStr
+		setClusterConfig(t, proxyURL, "stats_time", o)
 	}
-	if nlruconfig["dont_evict_time"] != configRegression["dont_evict_time"] {
+	if nlruconfig.DontEvictTimeStr != configRegression["dont_evict_time"] {
 		t.Errorf("DontEvictTime was not set properly: %v, should be: %v",
-			nlruconfig["dont_evict_time"], configRegression["dont_evict_time"])
+			nlruconfig.DontEvictTimeStr, configRegression["dont_evict_time"])
 	} else {
-		o := olruconfig["dont_evict_time"].(string)
-		setConfig("dont_evict_time", o, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setClusterConfig(t, proxyURL, "dont_evict_time", olruconfig.DontEvictTimeStr)
 	}
-	if nlruconfig["capacity_upd_time"] != configRegression["capacity_upd_time"] {
+	if nlruconfig.CapacityUpdTimeStr != configRegression["capacity_upd_time"] {
 		t.Errorf("CapacityUpdTime was not set properly: %v, should be: %v",
-			nlruconfig["capacity_upd_time"], configRegression["capacity_upd_time"])
+			nlruconfig.CapacityUpdTimeStr, configRegression["capacity_upd_time"])
 	} else {
-		o := olruconfig["capacity_upd_time"].(string)
-		setConfig("capacity_upd_time", o, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setClusterConfig(t, proxyURL, "capacity_upd_time", olruconfig.CapacityUpdTimeStr)
 	}
 	if hw, err := strconv.Atoi(configRegression["highwm"]); err != nil {
 		t.Fatalf("Error parsing HighWM: %v", err)
-	} else if nlruconfig["highwm"] != float64(hw) {
-		t.Errorf("HighWatermark was not set properly: %.0f, should be: %d",
-			nlruconfig["highwm"], hw)
+	} else if nlruconfig.HighWM != int64(hw) {
+		t.Errorf("HighWatermark was not set properly: %d, should be: %d",
+			nlruconfig.HighWM, hw)
 	} else {
-		o := olruconfig["highwm"].(float64)
-		setConfig("highwm", strconv.Itoa(int(o)), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setClusterConfig(t, proxyURL, "highwm", olruconfig.HighWM)
 	}
 	if lw, err := strconv.Atoi(configRegression["lowwm"]); err != nil {
 		t.Fatalf("Error parsing LowWM: %v", err)
-	} else if nlruconfig["lowwm"] != float64(lw) {
-		t.Errorf("LowWatermark was not set properly: %.0f, should be: %d",
-			nlruconfig["lowwm"], lw)
+	} else if nlruconfig.LowWM != int64(lw) {
+		t.Errorf("LowWatermark was not set properly: %d, should be: %d",
+			nlruconfig.LowWM, lw)
 	} else {
-		o := olruconfig["lowwm"].(float64)
-		setConfig("lowwm", strconv.Itoa(int(o)), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setClusterConfig(t, proxyURL, "lowwm", olruconfig.LowWM)
 	}
 	if pt, err := strconv.ParseBool(configRegression["lru_enabled"]); err != nil {
 		t.Fatalf("Error parsing LRUEnabled: %v", err)
-	} else if nlruconfig["lru_enabled"] != pt {
+	} else if nlruconfig.LRUEnabled != pt {
 		t.Errorf("LRUEnabled was not set properly: %v, should be %v",
-			nlruconfig["lru_enabled"], pt)
+			nlruconfig.LRUEnabled, pt)
 	} else {
-		o := olruconfig["lru_enabled"].(bool)
-		setConfig("lru_enabled", strconv.FormatBool(o), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setClusterConfig(t, proxyURL, "lru_enabled", olruconfig.LRUEnabled)
 	}
 }
 
@@ -765,7 +750,7 @@ func TestLRU(t *testing.T) {
 		t.Skip("TestLRU test requires a cloud bucket")
 	}
 
-	getRandomFiles(proxyURL, 0, 20, clibucket, "", t, nil, errCh)
+	getRandomFiles(proxyURL, 20, clibucket, "", t, nil, errCh)
 	// The error could be no object in the bucket. In that case, consider it as not an error;
 	// this test will be skipped
 	if len(errCh) != 0 {
@@ -782,20 +767,19 @@ func TestLRU(t *testing.T) {
 	bytesEvictedOrig := make(map[string]int64)
 	filesEvictedOrig := make(map[string]int64)
 	for k, di := range smap.Tmap {
-		cfg := getConfig(di.PublicNet.DirectURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
-		lrucfg := cfg["lru_config"].(map[string]interface{})
-		lwms[k] = lrucfg["lowwm"]
-		hwms[k] = lrucfg["highwm"]
+		cfg := getDaemonConfig(t, di.URL(cmn.NetworkPublic))
+		lwms[k] = cfg.LRU.LowWM
+		hwms[k] = cfg.LRU.HighWM
 	}
 	// add a few more
-	getRandomFiles(proxyURL, 0, 3, clibucket, "", t, nil, errCh)
+	getRandomFiles(proxyURL, 3, clibucket, "", t, nil, errCh)
 	selectErr(errCh, "get", t, true)
 	//
 	// find out min usage %% across all targets
 	//
 	stats := getClusterStats(t, proxyURL)
 	for k, v := range stats.Target {
-		bytesEvictedOrig[k], filesEvictedOrig[k] = v.Core.Tracker["lru.evict.size"].Value, v.Core.Tracker["lru.evict.n"].Value
+		bytesEvictedOrig[k], filesEvictedOrig[k] = getNamedTargetStats(v, "lru.evict.size"), getNamedTargetStats(v, "lru.evict.n")
 		for _, c := range v.Capacity {
 			usedpct = cmn.Min(usedpct, int(c.Usedpct))
 		}
@@ -810,23 +794,23 @@ func TestLRU(t *testing.T) {
 		t.Skip("skipping - cannot test LRU.")
 		return
 	}
-	oconfig := getConfig(proxyURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
+	oconfig := getDaemonConfig(t, proxyURL)
 	if t.Failed() {
 		return
 	}
 	//
 	// all targets: set new watermarks; restore upon exit
 	//
-	olruconfig := oconfig["lru_config"].(map[string]interface{})
-	operiodic := oconfig["periodic"].(map[string]interface{})
+	olruconfig := oconfig.LRU
+	operiodic := oconfig.Periodic
 	defer func() {
-		setConfig("dont_evict_time", olruconfig["dont_evict_time"].(string), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
-		setConfig("capacity_upd_time", olruconfig["capacity_upd_time"].(string), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
-		setConfig("highwm", fmt.Sprint(olruconfig["highwm"]), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
-		setConfig("lowwm", fmt.Sprint(olruconfig["lowwm"]), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+		setClusterConfig(t, proxyURL, "dont_evict_time", olruconfig.DontEvictTimeStr)
+		setClusterConfig(t, proxyURL, "capacity_upd_time", olruconfig.CapacityUpdTimeStr)
+		setClusterConfig(t, proxyURL, "highwm", olruconfig.HighWM)
+		setClusterConfig(t, proxyURL, "lowwm", olruconfig.LowWM)
 		for k, di := range smap.Tmap {
-			setConfig("highwm", fmt.Sprint(hwms[k]), di.PublicNet.DirectURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
-			setConfig("lowwm", fmt.Sprint(lwms[k]), di.PublicNet.DirectURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
+			setDaemonConfig(t, di.URL(cmn.NetworkPublic), "highwm", hwms[k])
+			setDaemonConfig(t, di.URL(cmn.NetworkPublic), "lowwm", lwms[k])
 		}
 	}()
 	//
@@ -834,43 +818,42 @@ func TestLRU(t *testing.T) {
 	//
 	dontevicttimestr := "30s"
 	capacityupdtimestr := "5s"
-	sleeptime, err := time.ParseDuration(operiodic["stats_time"].(string)) // to make sure the stats get updated
+	sleeptime, err := time.ParseDuration(operiodic.StatsTimeStr) // to make sure the stats get updated
 	if err != nil {
 		t.Fatalf("Failed to parse stats_time: %v", err)
 	}
-	setConfig("dont_evict_time", dontevicttimestr, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
-	setConfig("capacity_upd_time", capacityupdtimestr, proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+	setClusterConfig(t, proxyURL, "dont_evict_time", dontevicttimestr)
+	setClusterConfig(t, proxyURL, "capacity_upd_time", capacityupdtimestr)
 	if t.Failed() {
 		return
 	}
-	setConfig("lowwm", fmt.Sprint(lowwm), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+	setClusterConfig(t, proxyURL, "lowwm", lowwm)
 	if t.Failed() {
 		return
 	}
-	setConfig("highwm", fmt.Sprint(highwm), proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), t)
+	setClusterConfig(t, proxyURL, "highwm", highwm)
 	if t.Failed() {
 		return
 	}
 	waitProgressBar("LRU: ", sleeptime/2)
-	getRandomFiles(proxyURL, 0, 1, clibucket, "", t, nil, errCh)
+	getRandomFiles(proxyURL, 1, clibucket, "", t, nil, errCh)
 	waitProgressBar("LRU: ", sleeptime/2)
 	//
 	// results
 	//
 	stats = getClusterStats(t, proxyURL)
-	testFsPaths := oconfig["test_fspaths"].(map[string]interface{})
 	for k, v := range stats.Target {
-		bytes := v.Core.Tracker["lru.evict.size"].Value - bytesEvictedOrig[k]
+		bytes := getNamedTargetStats(v, "lru.evict.size") - bytesEvictedOrig[k]
 		tutils.Logf("Target %s: evicted %d files - %.2f MB (%dB) total\n",
-			k, v.Core.Tracker["lru.evict.n"].Value-filesEvictedOrig[k], float64(bytes)/1000/1000, bytes)
+			k, getNamedTargetStats(v, "lru.evict.n")-filesEvictedOrig[k], float64(bytes)/1000/1000, bytes)
 		//
-		// testingFSPpaths() - cannot reliably verify space utilization by tmpfs
+		// TestingEnv() - cannot reliably verify space utilization by tmpfs
 		//
-		if testFsPaths["count"].(float64) > 0 {
+		if oconfig.TestFSP.Count > 0 {
 			continue
 		}
 		for mpath, c := range v.Capacity {
-			if c.Usedpct < uint32(lowwm)-1 || c.Usedpct > uint32(lowwm)+1 {
+			if c.Usedpct < int64(lowwm-1) || c.Usedpct > int64(lowwm+1) {
 				t.Errorf("Target %s failed to reach lwm %d%%: mpath %s, used space %d%%", k, lowwm, mpath, c.Usedpct)
 			}
 		}
@@ -895,8 +878,7 @@ func TestPrefetchList(t *testing.T) {
 	smap := getClusterMap(t, proxyURL)
 	for _, v := range smap.Tmap {
 		stats := getDaemonStats(t, v.PublicNet.DirectURL)
-		corestats := stats["core"].(map[string]interface{})
-		npf, err := corestats["pre.n"].(json.Number).Int64()
+		npf, err := getPrefetchCnt(stats)
 		if err != nil {
 			t.Fatalf("Could not decode target stats: pre.n")
 		}
@@ -925,8 +907,7 @@ func TestPrefetchList(t *testing.T) {
 	// 5. Ensure that all the prefetches occurred.
 	for _, v := range smap.Tmap {
 		stats := getDaemonStats(t, v.PublicNet.DirectURL)
-		corestats := stats["core"].(map[string]interface{})
-		npf, err := corestats["pre.n"].(json.Number).Int64()
+		npf, err := getPrefetchCnt(stats)
 		if err != nil {
 			t.Fatalf("Could not decode target stats: pre.n")
 		}
@@ -935,6 +916,16 @@ func TestPrefetchList(t *testing.T) {
 	if netprefetches != n {
 		t.Errorf("Did not prefetch all files: Missing %d of %d\n", (n - netprefetches), n)
 	}
+}
+
+// FIXME: stop type-casting and use stats constants, here and elsewhere
+func getPrefetchCnt(stats map[string]interface{}) (npf int64, err error) {
+	corestats := stats["core"].(map[string]interface{})
+	if _, ok := corestats["pre.n"]; !ok {
+		return
+	}
+	npf, err = corestats["pre.n"].(json.Number).Int64()
+	return
 }
 
 func TestDeleteList(t *testing.T) {
@@ -958,7 +949,7 @@ func TestDeleteList(t *testing.T) {
 		keyname := fmt.Sprintf("%s%d", prefix, i)
 
 		wg.Add(1)
-		go tutils.PutAsync(wg, proxyURL, r, clibucket, keyname, errCh, true)
+		go tutils.PutAsync(wg, proxyURL, clibucket, keyname, r, errCh)
 		files = append(files, keyname)
 
 	}
@@ -974,7 +965,7 @@ func TestDeleteList(t *testing.T) {
 
 	// 3. Check to see that all the files have been deleted
 	msg := &cmn.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize)}
-	bktlst, err := tutils.ListBucket(proxyURL, clibucket, msg, 0)
+	bktlst, err := api.ListBucket(tutils.DefaultBaseAPIParams(t), clibucket, msg, 0)
 	tutils.CheckFatal(err, t)
 	if len(bktlst.Entries) != 0 {
 		t.Errorf("Incorrect number of remaining files: %d, should be 0", len(bktlst.Entries))
@@ -1003,8 +994,7 @@ func TestPrefetchRange(t *testing.T) {
 	smap := getClusterMap(t, proxyURL)
 	for _, v := range smap.Tmap {
 		stats := getDaemonStats(t, v.PublicNet.DirectURL)
-		corestats := stats["core"].(map[string]interface{})
-		npf, err := corestats["pre.n"].(json.Number).Int64()
+		npf, err := getPrefetchCnt(stats)
 		if err != nil {
 			t.Fatalf("Could not decode target stats: pre.n")
 		}
@@ -1059,8 +1049,7 @@ func TestPrefetchRange(t *testing.T) {
 	// 5. Ensure that all the prefetches occurred
 	for _, v := range smap.Tmap {
 		stats := getDaemonStats(t, v.PublicNet.DirectURL)
-		corestats := stats["core"].(map[string]interface{})
-		npf, err := corestats["pre.n"].(json.Number).Int64()
+		npf, err := getPrefetchCnt(stats)
 		if err != nil {
 			t.Fatalf("Could not decode target stats: pre.n")
 		}
@@ -1085,6 +1074,7 @@ func TestDeleteRange(t *testing.T) {
 		wg             = &sync.WaitGroup{}
 		errCh          = make(chan error, numfiles)
 		proxyURL       = getPrimaryURL(t, proxyURLRO)
+		baseParams     = tutils.DefaultBaseAPIParams(t)
 	)
 
 	if created := createLocalBucketIfNotExists(t, proxyURL, clibucket); created {
@@ -1097,7 +1087,7 @@ func TestDeleteRange(t *testing.T) {
 		tutils.CheckFatal(err, t)
 
 		wg.Add(1)
-		go tutils.PutAsync(wg, proxyURL, r, clibucket, fmt.Sprintf("%s%d", prefix, i), errCh, true)
+		go tutils.PutAsync(wg, proxyURL, clibucket, fmt.Sprintf("%s%d", prefix, i), r, errCh)
 	}
 	wg.Wait()
 	selectErr(errCh, "put", t, true)
@@ -1111,7 +1101,7 @@ func TestDeleteRange(t *testing.T) {
 
 	// 3. Check to see that the correct files have been deleted
 	msg := &cmn.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize)}
-	bktlst, err := tutils.ListBucket(proxyURL, clibucket, msg, 0)
+	bktlst, err := api.ListBucket(baseParams, clibucket, msg, 0)
 	tutils.CheckFatal(err, t)
 	if len(bktlst.Entries) != numfiles-smallrangesize {
 		t.Errorf("Incorrect number of remaining files: %d, should be %d", len(bktlst.Entries), numfiles-smallrangesize)
@@ -1137,7 +1127,7 @@ func TestDeleteRange(t *testing.T) {
 	}
 
 	// 5. Check to see that all the files have been deleted
-	bktlst, err = tutils.ListBucket(proxyURL, clibucket, msg, 0)
+	bktlst, err = api.ListBucket(baseParams, clibucket, msg, 0)
 	tutils.CheckFatal(err, t)
 	if len(bktlst.Entries) != 0 {
 		t.Errorf("Incorrect number of remaining files: %d, should be 0", len(bktlst.Entries))
@@ -1164,6 +1154,7 @@ func TestStressDeleteRange(t *testing.T) {
 		partial_rnge = fmt.Sprintf("%d:%d", 0, numFiles-tenth-1) // TODO: partial range with non-zero left boundary
 		rnge         = fmt.Sprintf("0:%d", numFiles)
 		readersList  [numReaders]tutils.Reader
+		baseParams   = tutils.DefaultBaseAPIParams(t)
 	)
 
 	createFreshLocalBucket(t, proxyURL, TestLocalBucketName)
@@ -1181,7 +1172,7 @@ func TestStressDeleteRange(t *testing.T) {
 		go func(i int, reader tutils.Reader) {
 			for j := 0; j < numFiles/numReaders; j++ {
 				objname := fmt.Sprintf("%s%d", prefix, i*numFiles/numReaders+j)
-				err := tutils.Put(proxyURL, reader, TestLocalBucketName, objname, true)
+				err = api.PutObject(baseParams, TestLocalBucketName, objname, reader.XXHash(), reader)
 				if err != nil {
 					errCh <- err
 				}
@@ -1204,7 +1195,7 @@ func TestStressDeleteRange(t *testing.T) {
 	// 3. Check to see that correct objects have been deleted
 	expectedRemaining := tenth
 	msg := &cmn.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize)}
-	bktlst, err := tutils.ListBucket(proxyURL, TestLocalBucketName, msg, 0)
+	bktlst, err := api.ListBucket(baseParams, TestLocalBucketName, msg, 0)
 	tutils.CheckFatal(err, t)
 	if len(bktlst.Entries) != expectedRemaining {
 		t.Errorf("Incorrect number of remaining objects: %d, expected: %d", len(bktlst.Entries), expectedRemaining)
@@ -1233,7 +1224,7 @@ func TestStressDeleteRange(t *testing.T) {
 
 	// 5. Check to see that all files have been deleted
 	msg = &cmn.GetMsg{GetPrefix: prefix, GetPageSize: int(pagesize)}
-	bktlst, err = tutils.ListBucket(proxyURL, TestLocalBucketName, msg, 0)
+	bktlst, err = api.ListBucket(baseParams, TestLocalBucketName, msg, 0)
 	tutils.CheckFatal(err, t)
 	if len(bktlst.Entries) != 0 {
 		t.Errorf("Incorrect number of remaining files: %d, should be 0", len(bktlst.Entries))
@@ -1243,10 +1234,11 @@ func TestStressDeleteRange(t *testing.T) {
 }
 
 func doRenameRegressionTest(t *testing.T, proxyURL string, rtd regressionTestData, numPuts int, filesPutCh chan string) {
-	err := api.RenameLocalBucket(tutils.HTTPClient, proxyURL, rtd.bucket, rtd.renamedBucket)
+	baseParams := tutils.BaseAPIParams(proxyURL)
+	err := api.RenameLocalBucket(baseParams, rtd.bucket, rtd.renamedBucket)
 	tutils.CheckFatal(err, t)
 
-	buckets, err := api.GetBucketNames(tutils.HTTPClient, proxyURL, true)
+	buckets, err := api.GetBucketNames(baseParams, true)
 	tutils.CheckFatal(err, t)
 
 	if len(buckets.Local) != rtd.numLocalBuckets {
@@ -1303,8 +1295,7 @@ func doBucketRegressionTest(t *testing.T, proxyURL string, rtd regressionTestDat
 		sgl = tutils.Mem2.NewSGL(filesize)
 		defer sgl.Free()
 	}
-	putRandObjs(proxyURL, baseseed+2, filesize, numPuts, bucket, errCh, filesPutCh, SmokeDir,
-		SmokeStr, !testing.Verbose(), sgl)
+	tutils.PutRandObjs(proxyURL, bucket, SmokeDir, readerType, SmokeStr, filesize, numPuts, errCh, filesPutCh, sgl)
 	close(filesPutCh)
 	selectErr(errCh, "put", t, true)
 	if rtd.rename {
@@ -1313,11 +1304,11 @@ func doBucketRegressionTest(t *testing.T, proxyURL string, rtd regressionTestDat
 		bucket = rtd.renamedBucket
 	}
 
-	getRandomFiles(proxyURL, 0, numPuts, bucket, SmokeStr+"/", t, nil, errCh)
+	getRandomFiles(proxyURL, numPuts, bucket, SmokeStr+"/", t, nil, errCh)
 	selectErr(errCh, "get", t, false)
 	for fname := range filesPutCh {
 		if usingFile {
-			err := os.Remove(SmokeDir + "/" + fname)
+			err := os.Remove(path.Join(SmokeDir, fname))
 			if err != nil {
 				t.Error(err)
 			}
@@ -1368,8 +1359,8 @@ OUTER:
 	}
 }
 
-func getXactionRebalance(proxyURL string) (dfc.RebalanceStats, error) {
-	var rebalanceStats dfc.RebalanceStats
+func getXactionRebalance(proxyURL string) (stats.RebalanceStats, error) {
+	var rebalanceStats stats.RebalanceStats
 	responseBytes, err := tutils.GetXactionResponse(proxyURL, cmn.XactionRebalance)
 	if err != nil {
 		return rebalanceStats, err
@@ -1403,7 +1394,7 @@ waitloop:
 	ticker.Stop()
 }
 
-func getClusterStats(t *testing.T, proxyURL string) (stats dfc.ClusterStats) {
+func getClusterStats(t *testing.T, proxyURL string) (stats stats.ClusterStats) {
 	q := tutils.GetWhatRawQuery(cmn.GetWhatStats, "")
 	url := fmt.Sprintf("%s?%s", proxyURL+cmn.URLPath(cmn.Version, cmn.Cluster), q)
 	resp, err := tutils.BaseHTTPClient.Get(url)
@@ -1427,6 +1418,14 @@ func getClusterStats(t *testing.T, proxyURL string) (stats dfc.ClusterStats) {
 	}
 
 	return
+}
+
+func getNamedTargetStats(trunner *stats.Trunner, name string) int64 {
+	if v, ok := trunner.Core.Tracker[name]; !ok {
+		return 0
+	} else {
+		return v.Value
+	}
 }
 
 func getDaemonStats(t *testing.T, url string) (stats map[string]interface{}) {
@@ -1459,62 +1458,30 @@ func getDaemonStats(t *testing.T, url string) (stats map[string]interface{}) {
 }
 
 func getClusterMap(t *testing.T, URL string) cluster.Smap {
-	smap, err := tutils.GetClusterMap(URL)
+	baseParams := tutils.BaseAPIParams(URL)
+	smap, err := api.GetClusterMap(baseParams)
 	tutils.CheckFatal(err, t)
 	return smap
 }
 
-func getConfig(URL string, t *testing.T) (dfcfg map[string]interface{}) {
-	q := tutils.GetWhatRawQuery(cmn.GetWhatConfig, "")
-	url := fmt.Sprintf("%s?%s", URL, q)
-	resp, err := tutils.BaseHTTPClient.Get(url)
-	if err != nil {
-		t.Fatalf("Failed to perform get, err = %v", err)
-	}
-	defer resp.Body.Close()
-
-	var b []byte
-	b, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Errorf("Failed to read response body, err = %v", err)
-		return
-	}
-
-	if resp.StatusCode >= http.StatusBadRequest {
-		t.Errorf("HTTP request get configuration failed, status = %d, %s",
-			resp.StatusCode, string(b))
-		return
-	}
-
-	err = jsoniter.Unmarshal(b, &dfcfg)
-	if err != nil {
-		t.Errorf("Failed to unmarshal config: %v", err)
-	}
-
+func getDaemonConfig(t *testing.T, URL string) (config *cmn.Config) {
+	var err error
+	baseParams := tutils.BaseAPIParams(URL)
+	config, err = api.GetDaemonConfig(baseParams)
+	tutils.CheckFatal(err, t)
 	return
 }
 
-func setConfig(name, value, URL string, t *testing.T) {
-	SetConfigMsg := cmn.ActionMsg{Action: cmn.ActSetConfig,
-		Name:  name,
-		Value: value,
-	}
+func setDaemonConfig(t *testing.T, daemonURL, key string, value interface{}) {
+	baseParams := tutils.BaseAPIParams(daemonURL)
+	err := api.SetDaemonConfig(baseParams, key, value)
+	tutils.CheckFatal(err, t)
+}
 
-	injson, err := jsoniter.Marshal(SetConfigMsg)
-	if err != nil {
-		t.Errorf("Failed to marshal SetConfig Message: %v", err)
-		return
-	}
-	req, err := http.NewRequest(http.MethodPut, URL, bytes.NewBuffer(injson))
-	if err != nil {
-		t.Errorf("Failed to create request: %v", err)
-		return
-	}
-	r, err := tutils.BaseHTTPClient.Do(req)
-	if err != nil {
-		t.Fatalf("Failed to perform request, err = %v", err)
-	}
-	defer r.Body.Close()
+func setClusterConfig(t *testing.T, proxyURL, key string, value interface{}) {
+	baseParams := tutils.BaseAPIParams(proxyURL)
+	err := api.SetClusterConfig(baseParams, key, value)
+	tutils.CheckFatal(err, t)
 }
 
 func selectErr(errCh chan error, verb string, t *testing.T, errisfatal bool) {

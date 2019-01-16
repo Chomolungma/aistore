@@ -7,6 +7,7 @@ package tutils_test
 import (
 	"io"
 	"os"
+	"path"
 	"reflect"
 	"testing"
 
@@ -46,7 +47,7 @@ func testReaderBasic(t *testing.T, r tutils.Reader, size int64) {
 			t.Fatal("Failed to read after seek", n, err)
 		}
 
-		if reflect.DeepEqual(buf, data[100:120]) != true {
+		if !reflect.DeepEqual(buf, data[100:120]) {
 			t.Fatal("Failed to match data after seek and read", buf, data[100:120])
 		}
 
@@ -66,7 +67,7 @@ func testReaderBasic(t *testing.T, r tutils.Reader, size int64) {
 			t.Fatal("Failed to read after seek", n, err)
 		}
 
-		if reflect.DeepEqual(buf, data[size-40:size-20]) != true {
+		if !reflect.DeepEqual(buf, data[size-40:size-20]) {
 			t.Fatal("Failed to match data after seek and read", buf, data[size-40:size-20])
 		}
 
@@ -86,7 +87,7 @@ func testReaderBasic(t *testing.T, r tutils.Reader, size int64) {
 			t.Fatal("Failed to read after seek", n, err)
 		}
 
-		if reflect.DeepEqual(buf, data[size-40:size-20]) != true {
+		if !reflect.DeepEqual(buf, data[size-40:size-20]) {
 			t.Fatal("Failed to match data after seek and read", buf, data[size-40:size-20])
 		}
 
@@ -142,7 +143,7 @@ func testReaderAdv(t *testing.T, r tutils.Reader, size int64) {
 			t.Fatal("Failed to read after seek", n, err)
 		}
 
-		if reflect.DeepEqual(buf, data[size-60:size-40]) != true {
+		if !reflect.DeepEqual(buf, data[size-60:size-40]) {
 			t.Fatal("Failed to match data after seek and read", buf, data[size-60:size-40])
 		}
 
@@ -284,13 +285,13 @@ func TestSGReader(t *testing.T) {
 }
 
 func BenchmarkFileReaderCreateWithHash1M(b *testing.B) {
-	path := "/tmp"
+	filepath := "/tmp"
 	fn := "reader-test"
 
 	for i := 0; i < b.N; i++ {
-		r, err := tutils.NewFileReader(path, fn, cmn.MiB, true /* withHash */)
+		r, err := tutils.NewFileReader(filepath, fn, cmn.MiB, true /* withHash */)
 		r.Close()
-		os.Remove(path + "/" + fn)
+		os.Remove(path.Join(filepath, fn))
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -332,13 +333,13 @@ func BenchmarkSGReaderCreateWithHash1M(b *testing.B) {
 }
 
 func BenchmarkFileReaderCreateNoHash1M(b *testing.B) {
-	path := "/tmp"
+	filepath := "/tmp"
 	fn := "reader-test"
 
 	for i := 0; i < b.N; i++ {
-		r, err := tutils.NewFileReader(path, fn, cmn.MiB, false /* withHash */)
+		r, err := tutils.NewFileReader(filepath, fn, cmn.MiB, false /* withHash */)
 		r.Close()
-		os.Remove(path + "/" + fn)
+		os.Remove(path.Join(filepath, fn))
 		if err != nil {
 			b.Fatal(err)
 		}

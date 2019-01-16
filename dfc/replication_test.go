@@ -19,7 +19,7 @@ const (
 )
 
 func TestReplicationRunnerStop(t *testing.T) {
-	fs.Mountpaths = fs.NewMountedFS(ctx.config.LocalBuckets, ctx.config.CloudBuckets)
+	fs.Mountpaths = fs.NewMountedFS()
 	tr := newFakeTargetRunner()
 	rr := newReplicationRunner(tr, fs.Mountpaths)
 	go rr.Run()
@@ -41,7 +41,7 @@ func TestReplicationRunnerStop(t *testing.T) {
 }
 
 func TestReplicationSendNonExistingObject(t *testing.T) {
-	fs.Mountpaths = fs.NewMountedFS(ctx.config.LocalBuckets, ctx.config.CloudBuckets)
+	fs.Mountpaths = fs.NewMountedFS()
 	cleanMountpaths()
 
 	tr := newFakeTargetRunner()
@@ -61,4 +61,14 @@ func newFakeTargetRunner() *targetrunner {
 	t := &targetrunner{}
 	t.si = newSnode(fakeDaemonID, httpProto, &net.TCPAddr{}, &net.TCPAddr{}, &net.TCPAddr{})
 	return t
+}
+
+func cleanMountpaths() {
+	availableMountpaths, disabledMountpaths := fs.Mountpaths.Get()
+	for _, mpathInfo := range availableMountpaths {
+		fs.Mountpaths.Remove(mpathInfo.Path)
+	}
+	for _, mpathInfo := range disabledMountpaths {
+		fs.Mountpaths.Remove(mpathInfo.Path)
+	}
 }

@@ -1,8 +1,7 @@
+// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 /*
  * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
  */
-// Package dfc is a scalable object-storage based caching system with Amazon and Google Cloud backends.
 package dfc
 
 import (
@@ -20,7 +19,7 @@ import (
 // TODO	1) readahead IFF utilization < (50%(or configured) || average across mountpaths)
 //	2) stats: average readahed per get.n, num readahead race losses
 //	3) readahead via user REST, with additional URLParam objectmem
-//	4) ctx.config.Readahead.TotalMem as long as < sigar.FreeMem
+//	4) config.Readahead.TotalMem as long as < sigar.FreeMem
 //	5) proxy AIMD, target to decide
 //	6) rangeOff/len
 //	7) utilize memsys
@@ -40,9 +39,10 @@ type (
 	}
 	readahead struct {
 		sync.Mutex
-		cmn.Named                       // to be a runner
-		joggers      map[string]*rahjogger // mpath => jogger
-		stopCh       chan struct{}         // to stop
+		cmn.NamedID
+		mountpaths *fs.MountedFS         //
+		joggers    map[string]*rahjogger // mpath => jogger
+		stopCh     chan struct{}         // to stop
 	}
 	rahjogger struct {
 		sync.Mutex
@@ -77,11 +77,13 @@ var pdummyrahfcache = &dummyrahfcache{}
 //
 //===========================================
 
-// as an fsprunner
-func (r *readahead) reqEnableMountpath(mpath string)  { r.addmp(mpath, "enabled") }
-func (r *readahead) reqDisableMountpath(mpath string) { r.delmp(mpath, "disabled") }
-func (r *readahead) reqAddMountpath(mpath string)     { r.addmp(mpath, "added") }
-func (r *readahead) reqRemoveMountpath(mpath string)  { r.delmp(mpath, "removed") }
+// as an fs.PathRunner
+var _ fs.PathRunner = &readahead{}
+
+func (r *readahead) ReqAddMountpath(mpath string)     { r.addmp(mpath, fs.Add) }
+func (r *readahead) ReqRemoveMountpath(mpath string)  { r.delmp(mpath, fs.Remove) }
+func (r *readahead) ReqEnableMountpath(mpath string)  { r.addmp(mpath, fs.Enable) }
+func (r *readahead) ReqDisableMountpath(mpath string) { r.delmp(mpath, fs.Disable) }
 
 func (r *readahead) addmp(mpath, tag string) {
 	r.Lock()
@@ -122,7 +124,7 @@ func newRahJogger(mpath string) (rj *rahjogger) {
 	rj.getCh = make(chan *rahfcache, rahChanSize)
 	rj.stopCh = make(chan struct{}, 4)
 
-	rj.slab = gmem2.SelectSlab2(ctx.config.Readahead.ObjectMem)
+	rj.slab = gmem2.SelectSlab2(cmn.GCO.Get().Readahead.ObjectMem)
 	rj.buf = rj.slab.Alloc()
 	return
 }
@@ -130,11 +132,11 @@ func newRahJogger(mpath string) (rj *rahjogger) {
 // as a runner
 func (r *readahead) Run() error {
 	glog.Infof("Starting %s", r.Getname())
-	availablePaths, _ := fs.Mountpaths.Mountpaths()
+	availablePaths, _ := fs.Mountpaths.Get()
 	for mpath := range availablePaths {
 		r.addmp(mpath, "added")
 	}
-	_ = <-r.stopCh // forever
+	<-r.stopCh // forever
 	return nil
 }
 func (r *readahead) Stop(err error) {
@@ -190,7 +192,7 @@ func (rahfcache *rahfcache) got() {
 
 // external API helper: route to the appropriate (jogger) child
 func (r *readahead) demux(fqn string) *rahjogger {
-	mpathInfo, _ := path2mpathInfo(fqn)
+	mpathInfo, _ := r.mountpaths.Path2MpathInfo(fqn)
 	if mpathInfo == nil {
 		glog.Errorf("Failed to get mountpath for %s", fqn)
 		return nil
@@ -268,6 +270,7 @@ func (rahfcache *rahfcache) readahead(buf []byte) {
 		size, fsize int64
 		stat        os.FileInfo
 		reader      io.Reader
+		config      = cmn.GCO.Get()
 	)
 
 	// 1. cleanup
@@ -296,13 +299,13 @@ func (rahfcache *rahfcache) readahead(buf []byte) {
 		return
 	}
 	if rahfcache.rangeLen == 0 {
-		fsize = cmn.MinI64(ctx.config.Readahead.ObjectMem, stat.Size())
+		fsize = cmn.MinI64(config.Readahead.ObjectMem, stat.Size())
 		reader = file
 	} else {
-		fsize = cmn.MinI64(ctx.config.Readahead.ObjectMem, rahfcache.rangeLen)
+		fsize = cmn.MinI64(config.Readahead.ObjectMem, rahfcache.rangeLen)
 		reader = io.NewSectionReader(file, rahfcache.rangeOff, rahfcache.rangeLen)
 	}
-	if !ctx.config.Readahead.Discard {
+	if !config.Readahead.Discard {
 		rahfcache.sgl = gmem2.NewSGL(fsize)
 	}
 	// 3. read

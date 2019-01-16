@@ -1,10 +1,9 @@
-/*
- * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
- *
- */
 // Package memsys provides memory management and Slab allocation
 // with io.Reader and io.Writer interfaces on top of a scatter-gather lists
 // (of reusable buffers)
+/*
+ * Copyright (c) 2018, NVIDIA CORPORATION. All rights reserved.
+ */
 package memsys
 
 import (
@@ -13,6 +12,13 @@ import (
 	"io"
 
 	"github.com/NVIDIA/dfcpub/cmn"
+)
+
+var (
+	_ cmn.ReadOpenCloser = &SGL{}
+	_ cmn.ReadOpenCloser = &Reader{}
+	_ cmn.ReadOpenCloser = &SliceReader{}
+	_ io.Seeker          = &SliceReader{}
 )
 
 type (
@@ -136,6 +142,8 @@ func (z *SGL) ReadAll() (b []byte, err error) {
 // reuse already allocated SGL
 func (z *SGL) Reset() { z.woff, z.roff = 0, 0 }
 
+func (z *SGL) Open() (io.ReadCloser, error) { return NewReader(z), nil }
+
 func (z *SGL) Close() error { return nil }
 
 func (z *SGL) Free() {
@@ -185,11 +193,16 @@ func (r *Reader) Seek(from int64, whence int) (offset int64, err error) {
 }
 
 //
-// SGL Slice Reader - implements io.ReadWriteCloser + io.Seeker within given bounds
+// SGL Slice Reader - implements cmn.ReadOpenCloser + io.Seeker within given bounds
 //
 
 func NewSliceReader(z *SGL, soff, slen int64) *SliceReader {
 	return &SliceReader{z: z, roff: 0, soff: soff, slen: slen}
+}
+
+func (r *SliceReader) Open() (io.ReadCloser, error) {
+	_, err := r.Seek(0, io.SeekStart)
+	return r, err
 }
 
 func (r *SliceReader) Close() error { return nil }

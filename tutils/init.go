@@ -15,8 +15,7 @@ import (
 )
 
 const (
-	registerTimeout    = time.Minute * 2
-	maxBodyErrorLength = 256
+	registerTimeout = time.Minute * 2
 )
 
 var (
@@ -26,11 +25,6 @@ var (
 		}).DialContext,
 		TLSHandshakeTimeout: 600 * time.Second,
 		MaxIdleConnsPerHost: 100, // arbitrary number, to avoid connect: cannot assign requested address
-	}
-	BaseHTTPClient = &http.Client{}
-	HTTPClient     = &http.Client{
-		Timeout:   600 * time.Second,
-		Transport: transport,
 	}
 	tr = &traceableTransport{
 		transport: transport,
@@ -42,12 +36,15 @@ var (
 		WroteRequest:         tr.WroteRequest,
 		GotFirstResponseByte: tr.GotFirstResponseByte,
 	}
-	tracedClient = &http.Client{Transport: tr}
-	Mem2         *memsys.Mem2
+	tracedClient   = &http.Client{Transport: tr}
+	BaseHTTPClient = &http.Client{}
+	HTTPClient     = &http.Client{
+		Timeout:   600 * time.Second,
+		Transport: transport,
+	}
+	Mem2 *memsys.Mem2
 )
 
 func init() {
-	Mem2 = &memsys.Mem2{Period: time.Minute * 2, Name: "ClientMem2"}
-	_ = Mem2.Init(false /* ignore init-time errors */)
-	go Mem2.Run()
+	Mem2 = memsys.Init()
 }

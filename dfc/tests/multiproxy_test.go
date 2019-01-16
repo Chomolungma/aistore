@@ -17,11 +17,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NVIDIA/dfcpub/api"
 	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
 	"github.com/NVIDIA/dfcpub/tutils"
 	"github.com/OneOfOne/xxhash"
-	"github.com/json-iterator/go"
+	jsoniter "github.com/json-iterator/go"
 )
 
 const (
@@ -113,7 +114,7 @@ func clusterHealthCheck(t *testing.T, smapBefore cluster.Smap) {
 	}
 
 	if tutils.DockerRunning() {
-		pCnt, tCnt := tutils.NumberOfRunningContainers()
+		pCnt, tCnt := tutils.ContainerCount()
 		if pCnt != len(smapAfter.Pmap) {
 			t.Fatalf("Some proxy conatiners crashed: expected %d, found %d containers", len(smapAfter.Pmap), pCnt)
 		}
@@ -142,10 +143,7 @@ func primaryCrashElectRestart(t *testing.T) {
 	smap := getClusterMap(t, proxyURL)
 	newPrimaryID, newPrimaryURL, err := chooseNextProxy(&smap)
 	tutils.CheckFatal(err, t)
-
-	if err = checkPmapVersions(proxyURL); err != nil {
-		t.Errorf("Cluster is inconsistent state: %v", err)
-	}
+	checkPmapVersions(t, proxyURL)
 
 	oldPrimaryURL := smap.ProxySI.PublicNet.DirectURL
 	oldPrimaryID := smap.ProxySI.DaemonID
@@ -176,9 +174,7 @@ func primaryCrashElectRestart(t *testing.T) {
 	if _, ok := smap.Pmap[oldPrimaryID]; !ok {
 		t.Fatalf("Previous primary proxy did not rejoin the cluster")
 	}
-	if err = checkPmapVersions(newPrimaryURL); err != nil {
-		t.Error(err)
-	}
+	checkPmapVersions(t, newPrimaryURL)
 }
 
 // primaryAndTargetCrash kills the primary p[roxy and one random target, verifies the next in
@@ -359,6 +355,7 @@ func targetRejoin(t *testing.T) {
 	}
 
 	cmd, args, err := kill(id, port)
+	tutils.CheckFatal(err, t)
 	smap, err = waitForPrimaryProxy(proxyURL, "to synchronize on 'target crashed'", smap.Version, testing.Verbose())
 	tutils.CheckFatal(err, t)
 
@@ -512,10 +509,11 @@ func targetMapVersionMismatch(getNum func(int) int, t *testing.T, proxyURL strin
 			break
 		}
 
-		url := v.PublicNet.DirectURL + cmn.URLPath(cmn.Version, cmn.Daemon, cmn.SyncSmap)
-		err := tutils.HTTPRequest(http.MethodPut, url, tutils.NewBytesReader(jsonMap))
+		baseParams := tutils.BaseAPIParams(v.URL(cmn.NetworkPublic))
+		baseParams.Method = http.MethodPut
+		path := cmn.URLPath(cmn.Version, cmn.Daemon, cmn.SyncSmap)
+		_, err = api.DoHTTPRequest(baseParams, path, jsonMap)
 		tutils.CheckFatal(err, t)
-
 		n--
 	}
 
@@ -581,27 +579,21 @@ func concurrentPutGetDel(t *testing.T) {
 // proxyPutGetDelete repeats put/get/del N times, all requests go to the same proxy
 func proxyPutGetDelete(seed int64, count int, proxyURL string) error {
 	random := rand.New(rand.NewSource(seed))
+	baseParams := tutils.BaseAPIParams(proxyURL)
 	for i := 0; i < count; i++ {
 		reader, err := tutils.NewRandReader(fileSize, true /* withHash */)
 		if err != nil {
 			return fmt.Errorf("Error creating reader: %v", err)
 		}
-
 		fname := tutils.FastRandomFilename(random, fnlen)
 		keyname := fmt.Sprintf("%s/%s", localBucketDir, fname)
-
-		err = tutils.Put(proxyURL, reader, clibucket, keyname, true /* silent */)
-		if err != nil {
+		if err = api.PutObject(baseParams, clibucket, keyname, reader.XXHash(), reader); err != nil {
 			return fmt.Errorf("Error executing put: %v", err)
 		}
-
-		tutils.Get(proxyURL, clibucket, keyname, nil /* wg */, nil /* errCh */, true /* silent */, false /* validate */)
-		if err != nil {
+		if _, err = api.GetObject(baseParams, clibucket, keyname); err != nil {
 			return fmt.Errorf("Error executing get: %v", err)
 		}
-
-		err = tutils.Del(proxyURL, clibucket, keyname, nil /* wg */, nil /* errCh */, true /* silent */)
-		if err != nil {
+		if err = tutils.Del(proxyURL, clibucket, keyname, nil /* wg */, nil /* errCh */, true /* silent */); err != nil {
 			return fmt.Errorf("Error executing del: %v", err)
 		}
 	}
@@ -618,6 +610,7 @@ func putGetDelWorker(proxyURL string, seed int64, stopch <-chan struct{}, proxyu
 
 	random := rand.New(rand.NewSource(seed))
 	missedDeleteCh := make(chan string, 100)
+	baseParams := tutils.BaseAPIParams(proxyURL)
 loop:
 	for {
 		select {
@@ -653,13 +646,12 @@ loop:
 		fname := tutils.FastRandomFilename(random, fnlen)
 		keyname := fmt.Sprintf("%s/%s", localBucketDir, fname)
 
-		err = tutils.Put(proxyURL, reader, localBucketName, keyname, true /* silent */)
+		err = api.PutObject(baseParams, localBucketName, keyname, reader.XXHash(), reader)
 		if err != nil {
 			errCh <- err
 			continue
 		}
-
-		_, _, err = tutils.Get(proxyURL, localBucketName, keyname, nil, errCh, true, false)
+		_, err = api.GetObject(baseParams, localBucketName, keyname)
 		if err != nil {
 			errCh <- err
 		}
@@ -791,19 +783,19 @@ func setPrimaryTo(t *testing.T, proxyURL string, smap cluster.Smap, directURL, t
 	if directURL == "" {
 		directURL = smap.ProxySI.PublicNet.DirectURL
 	}
-	url := directURL + cmn.URLPath(cmn.Version, cmn.Cluster, cmn.Proxy, toID)
 	// http://host:8081/v1/cluster/proxy/15205:8080
-	tutils.Logf("Setting primary from %s to %s: %s\n", smap.ProxySI.DaemonID, toID, url)
-	err := tutils.HTTPRequest(http.MethodPut, url, nil)
+
+	baseParams := tutils.BaseAPIParams(directURL)
+	tutils.Logf("Setting primary from %s to %s\n", smap.ProxySI.DaemonID, toID)
+	err := api.SetPrimaryProxy(baseParams, toID)
+	tutils.CheckFatal(err, t)
 
 	smap, err = waitForPrimaryProxy(proxyURL, "to designate new primary ID="+toID, smap.Version, testing.Verbose())
 	tutils.CheckFatal(err, t)
 	if smap.ProxySI.DaemonID != toID {
 		t.Fatalf("Expected primary=%s, got %s", toID, smap.ProxySI.DaemonID)
 	}
-	if err = checkPmapVersions(proxyURL); err != nil {
-		t.Fatal(err)
-	}
+	checkPmapVersions(t, proxyURL)
 }
 
 func chooseNextProxy(smap *cluster.Smap) (proxyid, proxyURL string, err error) {
@@ -933,27 +925,19 @@ func getProcess(port string) (string, string, []string, error) {
 
 // Read Pmap from all proxies and checks versions. If any proxy's smap version
 // differs from primary's one then an error returned
-func checkPmapVersions(proxyURL string) error {
-	smapPrimary, err := tutils.GetClusterMap(proxyURL)
-	if err != nil {
-		return err
-	}
-
+func checkPmapVersions(t *testing.T, proxyURL string) {
+	smapPrimary := getClusterMap(t, proxyURL)
 	for proxyID, proxyInfo := range smapPrimary.Pmap {
 		if proxyURL == proxyInfo.PublicNet.DirectURL {
 			continue
 		}
-		smap, err := tutils.GetClusterMap(proxyInfo.PublicNet.DirectURL)
-		if err != nil {
-			return err
-		}
+		smap := getClusterMap(t, proxyInfo.PublicNet.DirectURL)
 		if smap.Version != smapPrimary.Version {
-			return fmt.Errorf("Proxy %s has version %d, but primary proxy has version %d of Pmap",
+			err := fmt.Errorf("Proxy %s has version %d, but primary proxy has version %d of Pmap",
 				proxyID, smap.Version, smapPrimary.Version)
+			t.Error(err)
 		}
 	}
-
-	return nil
 }
 
 // waitForPrimaryProxy reads the current primary proxy(which is proxyurl)'s smap until its
@@ -995,8 +979,9 @@ func waitForPrimaryProxy(proxyURL, reason string, origVersion int64, verbose boo
 	}
 
 	var loopCnt int = 0
+	baseParams := tutils.BaseAPIParams(proxyURL)
 	for {
-		smap, err := tutils.GetClusterMap(proxyURL)
+		smap, err := api.GetClusterMap(baseParams)
 		if err != nil && !cmn.IsErrConnectionRefused(err) {
 			return cluster.Smap{}, err
 		}
@@ -1019,7 +1004,7 @@ func waitForPrimaryProxy(proxyURL, reason string, origVersion int64, verbose boo
 		// if the primary's map changed to the state we want, wait for the map get populated
 		if err == nil && smap.Version == lastVersion && smap.Version > origVersion && doCheckSMap {
 			for {
-				smap, err = tutils.GetClusterMap(proxyURL)
+				smap, err = api.GetClusterMap(baseParams)
 				if err == nil {
 					break
 				}
@@ -1076,9 +1061,9 @@ func primarySetToOriginal(t *testing.T) {
 	}
 	tutils.Logf("Setting primary proxy %s back to the original, Smap version %d\n", currID, smap.Version)
 
-	config := getConfig(proxyURL+cmn.URLPath(cmn.Version, cmn.Daemon), t)
-	proxyconf := config["proxyconfig"].(map[string]interface{})
-	origURL := proxyconf["original_url"].(string)
+	config := getDaemonConfig(t, proxyURL)
+	proxyconf := config.Proxy
+	origURL := proxyconf.OriginalURL
 
 	if origURL == "" {
 		t.Fatal("Original primary proxy is not defined in configuration")
@@ -1107,7 +1092,7 @@ func primarySetToOriginal(t *testing.T) {
 	}
 	tutils.Logf("Found original primary ID: %s\n", origID)
 	if currID == origID {
-		tutils.Logf("Original %s == the current primary: nothing to do", origID)
+		tutils.Logf("Original %s == the current primary: nothing to do\n", origID)
 		return
 	}
 
@@ -1243,6 +1228,7 @@ func networkFailurePrimary(t *testing.T) {
 	proxyCount, targetCount := len(smap.Pmap), len(smap.Tmap)
 	oldPrimaryID, oldPrimaryURL := smap.ProxySI.DaemonID, smap.ProxySI.PublicNet.DirectURL
 	newPrimaryID, newPrimaryURL, err := chooseNextProxy(&smap)
+	tutils.CheckFatal(err, t)
 
 	// Disconnect primary
 	tutils.Logf("Disconnecting primary %s from all networks\n", oldPrimaryID)
@@ -1272,9 +1258,7 @@ func networkFailurePrimary(t *testing.T) {
 	// connections and starts talking to neighbors
 	waitProgressBar("Wait for old primary is connected to network", 5*time.Second)
 
-	oldSmap, err := tutils.GetClusterMap(oldPrimaryURL)
-	tutils.CheckFatal(err, t)
-
+	oldSmap := getClusterMap(t, oldPrimaryURL)
 	// the original primary still thinks that it is the primary, so its smap
 	// should not change after the network is back
 	if oldSmap.ProxySI.DaemonID != oldPrimaryID {
@@ -1282,10 +1266,11 @@ func networkFailurePrimary(t *testing.T) {
 	}
 
 	// Forcefully set new primary for the original one
-	purl := oldPrimaryURL + cmn.URLPath(cmn.Version, cmn.Daemon, cmn.Proxy, newPrimaryID) +
+	baseParams := tutils.BaseAPIParams(oldPrimaryURL)
+	baseParams.Method = http.MethodPut
+	path := cmn.URLPath(cmn.Version, cmn.Daemon, cmn.Proxy, newPrimaryID) +
 		fmt.Sprintf("?%s=true&%s=%s", cmn.URLParamForce, cmn.URLParamPrimaryCandidate, url.QueryEscape(newPrimaryURL))
-
-	err = tutils.HTTPRequest(http.MethodPut, purl, nil)
+	_, err = api.DoHTTPRequest(baseParams, path, nil)
 	tutils.CheckFatal(err, t)
 
 	smap, err = waitForPrimaryProxy(

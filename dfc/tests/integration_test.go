@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"github.com/NVIDIA/dfcpub/api"
 	"github.com/NVIDIA/dfcpub/cluster"
 	"github.com/NVIDIA/dfcpub/cmn"
+	"github.com/NVIDIA/dfcpub/fs"
 	"github.com/NVIDIA/dfcpub/memsys"
 	"github.com/NVIDIA/dfcpub/tutils"
 )
@@ -31,11 +33,6 @@ const skipping = "skipping test in short mode."
 type repFile struct {
 	repetitions int
 	filename    string
-}
-
-type targetInfo struct {
-	sid       string
-	directURL string
 }
 
 type metadata struct {
@@ -68,7 +65,6 @@ func TestGetAndReRegisterInParallel(t *testing.T) {
 	const (
 		num       = 20000
 		filesize  = 1024
-		seed      = int64(111)
 		maxErrPct = 5
 	)
 
@@ -99,19 +95,19 @@ func TestGetAndReRegisterInParallel(t *testing.T) {
 		t.Fatalf("Must have 2 or more targets in the cluster, have only %d", m.originalTargetCount)
 	}
 
-	targets := extractTargetsInfo(m.smap)
-	err = tutils.UnregisterTarget(m.proxyURL, targets[0].sid)
+	// Step 2.
+	createFreshLocalBucket(t, m.proxyURL, m.bucket)
+	defer destroyLocalBucket(t, m.proxyURL, m.bucket)
+
+	target := extractTargetNodes(m.smap)[0]
+	err = tutils.UnregisterTarget(m.proxyURL, target.DaemonID)
 	tutils.CheckFatal(err, t)
 
 	n := len(getClusterMap(t, m.proxyURL).Tmap)
 	if n != m.originalTargetCount-1 {
 		t.Fatalf("%d targets expected after unregister, actually %d targets", m.originalTargetCount-1, n)
 	}
-	tutils.Logf("Unregistered target %s: the cluster now has %d targets\n", targets[0].directURL, n)
-
-	// Step 2.
-	createFreshLocalBucket(t, m.proxyURL, m.bucket)
-	defer destroyLocalBucket(t, m.proxyURL, m.bucket)
+	tutils.Logf("Unregistered target %s: the cluster now has %d targets\n", target.URL(cmn.NetworkPublic), n)
 
 	if usingSG {
 		sgl = tutils.Mem2.NewSGL(filesize)
@@ -121,7 +117,7 @@ func TestGetAndReRegisterInParallel(t *testing.T) {
 	// Step 3.
 	tutils.Logf("PUT %d objects into bucket %s...\n", num, m.bucket)
 	start := time.Now()
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -133,7 +129,7 @@ func TestGetAndReRegisterInParallel(t *testing.T) {
 	// Step 4.
 	m.wg.Add(num*m.numGetsEachFile + 1)
 	go func() {
-		doReregisterTarget(targets[0].sid, targets[0].directURL, &m)
+		doReregisterTarget(target, &m)
 		m.wg.Done()
 	}()
 	doGetsInParallel(&m)
@@ -162,7 +158,6 @@ func TestProxyFailbackAndReRegisterInParallel(t *testing.T) {
 		num                 = 20000
 		otherTasksToTrigger = 1
 		filesize            = 1024
-		seed                = int64(111)
 		maxErrPct           = 5
 	)
 
@@ -200,18 +195,18 @@ func TestProxyFailbackAndReRegisterInParallel(t *testing.T) {
 		t.Fatalf("Must have 3 or more proxies/gateways in the cluster, have only %d", m.originalProxyCount)
 	}
 
-	targets := extractTargetsInfo(m.smap)
-	err = tutils.UnregisterTarget(m.proxyURL, targets[0].sid)
+	// Step 2.
+	createFreshLocalBucket(t, m.proxyURL, m.bucket)
+	defer destroyLocalBucket(t, m.proxyURL, m.bucket)
+
+	target := extractTargetNodes(m.smap)[0]
+	err = tutils.UnregisterTarget(m.proxyURL, target.DaemonID)
 	tutils.CheckFatal(err, t)
 	n := len(getClusterMap(t, m.proxyURL).Tmap)
 	if n != m.originalTargetCount-1 {
 		t.Fatalf("%d targets expected after unregister, actually %d targets", m.originalTargetCount-1, n)
 	}
-	tutils.Logf("Unregistered target %s: the cluster now has %d targets\n", targets[0].directURL, n)
-
-	// Step 2.
-	createFreshLocalBucket(t, m.proxyURL, m.bucket)
-	defer destroyLocalBucket(t, m.proxyURL, m.bucket)
+	tutils.Logf("Unregistered target %s: the cluster now has %d targets\n", target.URL(cmn.NetworkPublic), n)
 
 	if usingSG {
 		sgl = tutils.Mem2.NewSGL(filesize)
@@ -220,8 +215,8 @@ func TestProxyFailbackAndReRegisterInParallel(t *testing.T) {
 
 	// Step 3.
 	_, newPrimaryURL, err := chooseNextProxy(&m.smap)
-	// use a new proxuURL because primaryCrashElectRestart has a side-effect:
-	// it changes the primary proxy. Without the change putRandObjs is
+	// use a new proxyURL because primaryCrashElectRestart has a side-effect:
+	// it changes the primary proxy. Without the change tutils.PutRandObjs is
 	// failing while the current primary is restarting and rejoining
 	m.proxyURL = newPrimaryURL
 	tutils.CheckFatal(err, t)
@@ -235,7 +230,7 @@ func TestProxyFailbackAndReRegisterInParallel(t *testing.T) {
 	// PUT phase is timed to ensure it doesn't finish before primaryCrashElectRestart() begins
 	time.Sleep(5 * time.Second)
 	tutils.Logf("PUT %d objects into bucket %s...\n", num, m.bucket)
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -252,7 +247,7 @@ func TestProxyFailbackAndReRegisterInParallel(t *testing.T) {
 	m.wg.Add(m.num*m.numGetsEachFile + 2)
 
 	go func() {
-		doReregisterTarget(targets[0].sid, targets[0].directURL, &m)
+		doReregisterTarget(target, &m)
 		m.wg.Done()
 	}()
 
@@ -289,18 +284,18 @@ func TestUnregisterPreviouslyUnregisteredTarget(t *testing.T) {
 	}
 	tutils.Logf("Num targets %d, num proxies %d\n", m.originalTargetCount, m.originalProxyCount)
 
-	targets := extractTargetsInfo(m.smap)
+	target := extractTargetNodes(m.smap)[0]
 	// Unregister target
-	err = tutils.UnregisterTarget(m.proxyURL, targets[0].sid)
+	err = tutils.UnregisterTarget(m.proxyURL, target.DaemonID)
 	tutils.CheckFatal(err, t)
 	n := len(getClusterMap(t, m.proxyURL).Tmap)
 	if n != m.originalTargetCount-1 {
 		t.Fatalf("%d targets expected after unregister, actually %d targets", m.originalTargetCount-1, n)
 	}
-	tutils.Logf("Unregistered target %s: the cluster now has %d targets\n", targets[0].directURL, n)
+	tutils.Logf("Unregistered target %s: the cluster now has %d targets\n", target.URL(cmn.NetworkPublic), n)
 
 	// Unregister same target again
-	err = tutils.UnregisterTarget(m.proxyURL, targets[0].sid)
+	err = tutils.UnregisterTarget(m.proxyURL, target.DaemonID)
 	if err == nil || !strings.Contains(err.Error(), "Not Found") {
 		t.Fatal("Unregistering the same target twice must return error 404")
 	}
@@ -308,19 +303,17 @@ func TestUnregisterPreviouslyUnregisteredTarget(t *testing.T) {
 	if n != m.originalTargetCount-1 {
 		t.Fatalf("%d targets expected after unregister, actually %d targets", m.originalTargetCount-1, n)
 	}
-	tutils.Logf("Unregistered target %s: the cluster now has %d targets\n", targets[0].directURL, n)
+	tutils.Logf("Unregistered target %s: the cluster now has %d targets\n", target.URL(cmn.NetworkPublic), n)
 
 	// Register target (bring cluster to normal state)
-	doReregisterTarget(targets[0].sid, targets[0].directURL, &m)
+	doReregisterTarget(target, &m)
 	assertClusterState(&m)
 }
 
 func TestRegisterAndUnregisterTargetAndPutInParallel(t *testing.T) {
 	const (
-		num       = 10000
-		filesize  = 1024
-		seed      = int64(111)
-		maxErrPct = 5
+		num      = 10000
+		filesize = 1024
 	)
 
 	var (
@@ -350,7 +343,7 @@ func TestRegisterAndUnregisterTargetAndPutInParallel(t *testing.T) {
 	if m.originalTargetCount < 3 {
 		t.Fatalf("Must have 3 or more targets in the cluster, have only %d", m.originalTargetCount)
 	}
-	targets := extractTargetsInfo(m.smap)
+	targets := extractTargetNodes(m.smap)
 
 	// Create local bucket
 	m.bucket = TestLocalBucketName
@@ -363,7 +356,7 @@ func TestRegisterAndUnregisterTargetAndPutInParallel(t *testing.T) {
 	}
 
 	// Unregister target 0
-	err = tutils.UnregisterTarget(m.proxyURL, targets[0].sid)
+	err = tutils.UnregisterTarget(m.proxyURL, targets[0].DaemonID)
 	tutils.CheckFatal(err, t)
 	n := len(getClusterMap(t, m.proxyURL).Tmap)
 	if n != m.originalTargetCount-1 {
@@ -375,7 +368,7 @@ func TestRegisterAndUnregisterTargetAndPutInParallel(t *testing.T) {
 	go func() {
 		// Put some files
 		tutils.Logf("PUT %d files into bucket %s...\n", num, m.bucket)
-		putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+		tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 		selectErr(errCh, "put", t, false)
 		close(filenameCh)
 		close(errCh)
@@ -387,28 +380,28 @@ func TestRegisterAndUnregisterTargetAndPutInParallel(t *testing.T) {
 	// Register target 0 in parallel
 	m.wg.Add(1)
 	go func() {
-		tutils.Logf("Registering target: %s\n", targets[0].directURL)
-		err = tutils.RegisterTarget(targets[0].sid, targets[0].directURL, m.smap)
+		tutils.Logf("Registering target: %s\n", targets[0].URL(cmn.NetworkPublic))
+		err = tutils.RegisterTarget(m.proxyURL, targets[0], m.smap)
 		tutils.CheckFatal(err, t)
 		m.wg.Done()
-		tutils.Logf("Registered target %s again\n", targets[0].directURL)
+		tutils.Logf("Registered target %s again\n", targets[0].URL(cmn.NetworkPublic))
 	}()
 
 	// Unregister target 1 in parallel
 	m.wg.Add(1)
 	go func() {
-		tutils.Logf("Unregistering target: %s\n", targets[1].directURL)
-		err = tutils.UnregisterTarget(m.proxyURL, targets[1].sid)
+		tutils.Logf("Unregistering target: %s\n", targets[1].URL(cmn.NetworkPublic))
+		err = tutils.UnregisterTarget(m.proxyURL, targets[1].DaemonID)
 		tutils.CheckFatal(err, t)
 		m.wg.Done()
-		tutils.Logf("Unregistered target %s\n", targets[1].directURL)
+		tutils.Logf("Unregistered target %s\n", targets[1].URL(cmn.NetworkPublic))
 	}()
 
 	// Wait for everything to end
 	m.wg.Wait()
 
 	// Register target 1 to bring cluster to original state
-	doReregisterTarget(targets[1].sid, targets[1].directURL, &m)
+	doReregisterTarget(targets[1], &m)
 	assertClusterState(&m)
 }
 
@@ -420,7 +413,6 @@ func TestRebalanceAfterUnregisterAndReregister(t *testing.T) {
 	const (
 		num       = 10000
 		filesize  = 1024
-		seed      = int64(111)
 		maxErrPct = 0
 	)
 
@@ -446,7 +438,7 @@ func TestRebalanceAfterUnregisterAndReregister(t *testing.T) {
 	if m.originalTargetCount < 3 {
 		t.Fatalf("Must have 3 or more targets in the cluster, have only %d", m.originalTargetCount)
 	}
-	targets := extractTargetsInfo(m.smap)
+	targets := extractTargetNodes(m.smap)
 
 	// Create local bucket
 	createFreshLocalBucket(t, m.proxyURL, m.bucket)
@@ -458,7 +450,7 @@ func TestRebalanceAfterUnregisterAndReregister(t *testing.T) {
 	}
 
 	// Unregister target 0
-	err = tutils.UnregisterTarget(m.proxyURL, targets[0].sid)
+	err = tutils.UnregisterTarget(m.proxyURL, targets[0].DaemonID)
 	tutils.CheckFatal(err, t)
 	n := len(getClusterMap(t, m.proxyURL).Tmap)
 	if n != m.originalTargetCount-1 {
@@ -467,7 +459,7 @@ func TestRebalanceAfterUnregisterAndReregister(t *testing.T) {
 
 	// Put some files
 	tutils.Logf("PUT %d objects into bucket %s...\n", num, m.bucket)
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -479,28 +471,28 @@ func TestRebalanceAfterUnregisterAndReregister(t *testing.T) {
 	// Register target 0 in parallel
 	m.wg.Add(1)
 	go func() {
-		tutils.Logf("trying to register target: %s\n", targets[0].directURL)
-		err = tutils.RegisterTarget(targets[0].sid, targets[0].directURL, m.smap)
+		tutils.Logf("trying to register target: %s\n", targets[0].URL(cmn.NetworkPublic))
+		err = tutils.RegisterTarget(m.proxyURL, targets[0], m.smap)
 		tutils.CheckFatal(err, t)
 		m.wg.Done()
-		tutils.Logf("registered target %s again\n", targets[0].directURL)
+		tutils.Logf("registered target %s again\n", targets[0].URL(cmn.NetworkPublic))
 	}()
 
 	// Unregister target 1 in parallel
 	m.wg.Add(1)
 	go func() {
-		tutils.Logf("trying to unregister target: %s\n", targets[1].directURL)
-		err = tutils.UnregisterTarget(m.proxyURL, targets[1].sid)
+		tutils.Logf("trying to unregister target: %s\n", targets[1].URL(cmn.NetworkPublic))
+		err = tutils.UnregisterTarget(m.proxyURL, targets[1].DaemonID)
 		tutils.CheckFatal(err, t)
 		m.wg.Done()
-		tutils.Logf("unregistered target %s\n", targets[1].directURL)
+		tutils.Logf("unregistered target %s\n", targets[1].URL(cmn.NetworkPublic))
 	}()
 
 	// Wait for everything to end
 	m.wg.Wait()
 
 	// Register target 1 to bring cluster to original state
-	doReregisterTarget(targets[1].sid, targets[1].directURL, &m)
+	doReregisterTarget(targets[1], &m)
 	tutils.Logln("reregistering complete")
 
 	waitForRebalanceToComplete(t, m.proxyURL)
@@ -519,10 +511,8 @@ func TestPutDuringRebalance(t *testing.T) {
 	}
 
 	const (
-		num       = 10000
-		filesize  = 1024
-		seed      = int64(111)
-		maxErrPct = 0
+		num      = 10000
+		filesize = 1024
 	)
 
 	var (
@@ -547,7 +537,7 @@ func TestPutDuringRebalance(t *testing.T) {
 	if m.originalTargetCount < 3 {
 		t.Fatalf("Must have 3 or more targets in the cluster, have only %d", m.originalTargetCount)
 	}
-	targets := extractTargetsInfo(m.smap)
+	target := extractTargetNodes(m.smap)[0]
 
 	// Create local bucket
 	createFreshLocalBucket(t, m.proxyURL, m.bucket)
@@ -559,8 +549,8 @@ func TestPutDuringRebalance(t *testing.T) {
 	}
 
 	// Unregister a target
-	tutils.Logf("Trying to unregister target: %s\n", targets[0].directURL)
-	err = tutils.UnregisterTarget(m.proxyURL, targets[0].sid)
+	tutils.Logf("Trying to unregister target: %s\n", target.URL(cmn.NetworkPublic))
+	err = tutils.UnregisterTarget(m.proxyURL, target.DaemonID)
 	tutils.CheckFatal(err, t)
 	n := len(getClusterMap(t, m.proxyURL).Tmap)
 	if n != m.originalTargetCount-1 {
@@ -572,15 +562,15 @@ func TestPutDuringRebalance(t *testing.T) {
 	go func() {
 		// sleep some time to wait for PUT operations to begin
 		time.Sleep(3 * time.Second)
-		tutils.Logf("Trying to register target: %s\n", targets[0].directURL)
-		err = tutils.RegisterTarget(targets[0].sid, targets[0].directURL, m.smap)
+		tutils.Logf("Trying to register target: %s\n", target.URL(cmn.NetworkPublic))
+		err = tutils.RegisterTarget(m.proxyURL, target, m.smap)
 		tutils.CheckFatal(err, t)
 		m.wg.Done()
-		tutils.Logf("Target %s is registered again.\n", targets[0].directURL)
+		tutils.Logf("Target %s is registered again.\n", target.URL(cmn.NetworkPublic))
 	}()
 
 	tutils.Logf("PUT %d objects into bucket %s...\n", num, m.bucket)
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -612,7 +602,6 @@ func TestGetDuringLocalAndGlobalRebalance(t *testing.T) {
 	const (
 		num       = 20000
 		filesize  = 1024
-		seed      = int64(112)
 		maxErrPct = 0
 	)
 
@@ -649,24 +638,22 @@ func TestGetDuringLocalAndGlobalRebalance(t *testing.T) {
 	}
 
 	var (
-		targetURL     string
-		killTargetURL string
-		killTargetSI  string
+		targetURL  string
+		killTarget *cluster.Snode
 	)
 
 	// select a random target to disable one of its mountpaths,
 	// and another random target to unregister
-	for _, tinfo := range md.smap.Tmap {
+	for _, target := range md.smap.Tmap {
 		if targetURL == "" {
-			targetURL = tinfo.PublicNet.DirectURL
+			targetURL = target.PublicNet.DirectURL
 		} else {
-			killTargetURL = tinfo.PublicNet.DirectURL
-			killTargetSI = tinfo.DaemonID
+			killTarget = target
 			break
 		}
 	}
-
-	mpList, err := tutils.TargetMountpaths(targetURL)
+	baseParams := tutils.BaseAPIParams(targetURL)
+	mpList, err := api.GetMountpaths(baseParams)
 	tutils.CheckFatal(err, t)
 
 	if len(mpList.Available) < 2 {
@@ -675,11 +662,12 @@ func TestGetDuringLocalAndGlobalRebalance(t *testing.T) {
 
 	// Disable mountpaths temporarily
 	mpath := mpList.Available[0]
-	err = tutils.DisableTargetMountpath(targetURL, mpath)
+	err = api.DisableMountpath(baseParams, mpath)
+	tutils.CheckFatal(err, t)
 
 	// Unregister a target
-	tutils.Logf("Trying to unregister target: %s\n", killTargetURL)
-	err = tutils.UnregisterTarget(md.proxyURL, killTargetSI)
+	tutils.Logf("Trying to unregister target: %s\n", killTarget.URL(cmn.NetworkPublic))
+	err = tutils.UnregisterTarget(md.proxyURL, killTarget.DaemonID)
 	tutils.CheckFatal(err, t)
 	smap, err := waitForPrimaryProxy(
 		md.proxyURL,
@@ -691,7 +679,7 @@ func TestGetDuringLocalAndGlobalRebalance(t *testing.T) {
 	tutils.CheckFatal(err, md.t)
 
 	tutils.Logf("PUT %d objects into bucket %s...\n", num, md.bucket)
-	putRandObjs(md.proxyURL, seed, filesize, num, md.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(md.proxyURL, md.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -707,11 +695,11 @@ func TestGetDuringLocalAndGlobalRebalance(t *testing.T) {
 	}()
 
 	// register a new target
-	err = tutils.RegisterTarget(killTargetSI, killTargetURL, md.smap)
+	err = tutils.RegisterTarget(md.proxyURL, killTarget, md.smap)
 	tutils.CheckFatal(err, t)
 
 	// enable mountpath
-	err = tutils.EnableTargetMountpath(targetURL, mpath)
+	err = api.EnableMountpath(baseParams, mpath)
 	tutils.CheckFatal(err, t)
 
 	// wait until GETs are done while 2 rebalance are running
@@ -729,7 +717,7 @@ func TestGetDuringLocalAndGlobalRebalance(t *testing.T) {
 
 	resultsBeforeAfter(&md, num, maxErrPct)
 
-	mpListAfter, err := tutils.TargetMountpaths(targetURL)
+	mpListAfter, err := api.GetMountpaths(baseParams)
 	tutils.CheckFatal(err, t)
 	if len(mpList.Available) != len(mpListAfter.Available) {
 		t.Fatalf("Some mountpaths failed to enable: the number before %d, after %d",
@@ -745,7 +733,6 @@ func TestGetDuringLocalRebalance(t *testing.T) {
 	const (
 		num       = 20000
 		filesize  = 1024
-		seed      = int64(112)
 		maxErrPct = 0
 	)
 
@@ -786,8 +773,8 @@ func TestGetDuringLocalRebalance(t *testing.T) {
 		targetURL = tinfo.PublicNet.DirectURL
 		break
 	}
-
-	mpList, err := tutils.TargetMountpaths(targetURL)
+	baseParams := tutils.BaseAPIParams(targetURL)
+	mpList, err := api.GetMountpaths(baseParams)
 	tutils.CheckFatal(err, t)
 
 	if len(mpList.Available) < 2 {
@@ -802,12 +789,12 @@ func TestGetDuringLocalRebalance(t *testing.T) {
 
 	// Disable mountpaths temporarily
 	for _, mp := range mpaths {
-		err = tutils.DisableTargetMountpath(targetURL, mp)
+		err = api.DisableMountpath(baseParams, mp)
 		tutils.CheckFatal(err, t)
 	}
 
 	tutils.Logf("PUT %d objects into bucket %s...\n", num, md.bucket)
-	putRandObjs(md.proxyURL, seed, filesize, num, md.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(md.proxyURL, md.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -823,14 +810,14 @@ func TestGetDuringLocalRebalance(t *testing.T) {
 	for _, mp := range mpaths {
 		// sleep for a while before enabling another mountpath
 		time.Sleep(50 * time.Millisecond)
-		err = tutils.EnableTargetMountpath(targetURL, mp)
+		err = api.EnableMountpath(baseParams, mp)
 		tutils.CheckFatal(err, t)
 	}
 
 	md.wg.Wait()
 	resultsBeforeAfter(&md, num, maxErrPct)
 
-	mpListAfter, err := tutils.TargetMountpaths(targetURL)
+	mpListAfter, err := api.GetMountpaths(baseParams)
 	tutils.CheckFatal(err, t)
 	if len(mpList.Available) != len(mpListAfter.Available) {
 		t.Fatalf("Some mountpaths failed to enable: the number before %d, after %d",
@@ -846,7 +833,6 @@ func TestGetDuringRebalance(t *testing.T) {
 	const (
 		num       = 10000
 		filesize  = 1024
-		seed      = int64(111)
 		maxErrPct = 0
 	)
 
@@ -884,7 +870,7 @@ func TestGetDuringRebalance(t *testing.T) {
 	if md.originalTargetCount < 3 {
 		t.Fatalf("Must have 3 or more targets in the cluster, have only %d", md.originalTargetCount)
 	}
-	targets := extractTargetsInfo(md.smap)
+	target := extractTargetNodes(md.smap)[0]
 
 	// Create local bucket
 	createFreshLocalBucket(t, md.proxyURL, md.bucket)
@@ -896,7 +882,7 @@ func TestGetDuringRebalance(t *testing.T) {
 	}
 
 	// Unregister a target
-	err = tutils.UnregisterTarget(md.proxyURL, targets[0].sid)
+	err = tutils.UnregisterTarget(md.proxyURL, target.DaemonID)
 	tutils.CheckFatal(err, t)
 	n := len(getClusterMap(t, md.proxyURL).Tmap)
 	if n != md.originalTargetCount-1 {
@@ -905,7 +891,7 @@ func TestGetDuringRebalance(t *testing.T) {
 
 	// Start putting files into bucket
 	tutils.Logf("PUT %d objects into bucket %s...\n", num, md.bucket)
-	putRandObjs(md.proxyURL, seed, filesize, num, md.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(md.proxyURL, md.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -919,8 +905,8 @@ func TestGetDuringRebalance(t *testing.T) {
 	md.wg.Add(num * md.numGetsEachFile)
 	doGetsInParallel(&md)
 
-	tutils.Logf("Trying to register target: %s\n", targets[0].directURL)
-	err = tutils.RegisterTarget(targets[0].sid, targets[0].directURL, md.smap)
+	tutils.Logf("Trying to register target: %s\n", target.URL(cmn.NetworkPublic))
+	err = tutils.RegisterTarget(md.proxyURL, target, md.smap)
 	tutils.CheckFatal(err, t)
 
 	// wait for everything to finish
@@ -959,23 +945,23 @@ func TestRegisterTargetsAndCreateLocalBucketsInParallel(t *testing.T) {
 		t.Fatalf("Must have 3 or more targets in the cluster, have only %d", m.originalTargetCount)
 	}
 	tutils.Logf("Num targets %d\n", m.originalTargetCount)
-	targets := extractTargetsInfo(m.smap)
+	targets := extractTargetNodes(m.smap)
 
 	// Unregister targets
 	for i := 0; i < unregisterTargetCount; i++ {
-		err = tutils.UnregisterTarget(m.proxyURL, targets[i].sid)
+		err = tutils.UnregisterTarget(m.proxyURL, targets[i].DaemonID)
 		tutils.CheckFatal(err, t)
 		n := len(getClusterMap(t, m.proxyURL).Tmap)
 		if n != m.originalTargetCount-(i+1) {
 			t.Fatalf("%d targets expected after unregister, actually %d targets", m.originalTargetCount-(i+1), n)
 		}
-		tutils.Logf("Unregistered target %s: the cluster now has %d targets\n", targets[i].directURL, n)
+		tutils.Logf("Unregistered target %s: the cluster now has %d targets\n", targets[i].URL(cmn.NetworkPublic), n)
 	}
 
 	m.wg.Add(unregisterTargetCount)
 	for i := 0; i < unregisterTargetCount; i++ {
 		go func(number int) {
-			err = tutils.RegisterTarget(targets[number].sid, targets[number].directURL, m.smap)
+			err = tutils.RegisterTarget(m.proxyURL, targets[number], m.smap)
 			tutils.CheckFatal(err, t)
 			m.wg.Done()
 		}(i)
@@ -1018,7 +1004,7 @@ func TestRenameEmptyLocalBucket(t *testing.T) {
 	destroyLocalBucket(t, m.proxyURL, newTestLocalBucketName)
 
 	// Rename it
-	err = api.RenameLocalBucket(tutils.HTTPClient, m.proxyURL, m.bucket, newTestLocalBucketName)
+	err = api.RenameLocalBucket(tutils.DefaultBaseAPIParams(t), m.bucket, newTestLocalBucketName)
 	tutils.CheckFatal(err, t)
 
 	// Destroy renamed local bucket
@@ -1030,7 +1016,6 @@ func TestRenameNonEmptyLocalBucket(t *testing.T) {
 		newTestLocalBucketName = TestLocalBucketName + "_new"
 		num                    = 1000
 		filesize               = 1024
-		seed                   = int64(111)
 		maxErrPct              = 0
 	)
 
@@ -1068,7 +1053,7 @@ func TestRenameNonEmptyLocalBucket(t *testing.T) {
 
 	// Put some files
 	tutils.Logf("PUT %d objects into bucket %s...\n", num, m.bucket)
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -1081,7 +1066,7 @@ func TestRenameNonEmptyLocalBucket(t *testing.T) {
 	// Rename it
 	oldLocalBucketName := m.bucket
 	m.bucket = newTestLocalBucketName
-	err = api.RenameLocalBucket(tutils.HTTPClient, m.proxyURL, oldLocalBucketName, m.bucket)
+	err = api.RenameLocalBucket(tutils.DefaultBaseAPIParams(t), oldLocalBucketName, m.bucket)
 	tutils.CheckFatal(err, t)
 
 	// Gets on renamed local bucket
@@ -1118,7 +1103,7 @@ func TestDirectoryExistenceWhenModifyingBucket(t *testing.T) {
 		if localBucketDir != "" {
 			return filepath.SkipDir
 		}
-		if strings.HasSuffix(path, "/local") {
+		if strings.HasSuffix(path, "/local") && strings.Contains(path, fs.ObjectType) {
 			localBucketDir = path
 			return filepath.SkipDir
 		}
@@ -1138,7 +1123,7 @@ func TestDirectoryExistenceWhenModifyingBucket(t *testing.T) {
 	}
 
 	// Rename local bucket
-	err = api.RenameLocalBucket(tutils.HTTPClient, m.proxyURL, m.bucket, newTestLocalBucketName)
+	err = api.RenameLocalBucket(tutils.DefaultBaseAPIParams(t), m.bucket, newTestLocalBucketName)
 	tutils.CheckFatal(err, t)
 	if _, err := os.Stat(bucketFQN); !os.IsNotExist(err) {
 		t.Fatalf("local bucket folder was not deleted")
@@ -1159,7 +1144,6 @@ func TestAddAndRemoveMountpath(t *testing.T) {
 	const (
 		num       = 5000
 		filesize  = 1024
-		seed      = int64(111)
 		maxErrPct = 0
 	)
 
@@ -1194,19 +1178,19 @@ func TestAddAndRemoveMountpath(t *testing.T) {
 	if m.originalTargetCount < 1 {
 		t.Fatalf("Must have 1 or more targets in the cluster, have only %d", m.originalTargetCount)
 	}
-	targets := extractTargetsInfo(m.smap)
-
+	target := extractTargetNodes(m.smap)[0]
+	baseParams := tutils.BaseAPIParams(target.URL(cmn.NetworkPublic))
 	// Remove all mountpaths for one target
-	oldMountpaths, err := tutils.TargetMountpaths(targets[0].directURL)
+	oldMountpaths, err := api.GetMountpaths(baseParams)
 	tutils.CheckFatal(err, t)
 
 	for _, mpath := range oldMountpaths.Available {
-		err = tutils.RemoveTargetMountpath(targets[0].directURL, mpath)
+		err = api.RemoveMountpath(baseParams, mpath)
 		tutils.CheckFatal(err, t)
 	}
 
 	// Check if mountpaths were actually removed
-	mountpaths, err := tutils.TargetMountpaths(targets[0].directURL)
+	mountpaths, err := api.GetMountpaths(baseParams)
 	tutils.CheckFatal(err, t)
 
 	if len(mountpaths.Available) != 0 {
@@ -1219,12 +1203,12 @@ func TestAddAndRemoveMountpath(t *testing.T) {
 
 	// Add target mountpath again
 	for _, mpath := range oldMountpaths.Available {
-		err = tutils.AddTargetMountpath(targets[0].directURL, mpath)
+		err = api.AddMountpath(baseParams, mpath)
 		tutils.CheckFatal(err, t)
 	}
 
 	// Check if mountpaths were actually added
-	mountpaths, err = tutils.TargetMountpaths(targets[0].directURL)
+	mountpaths, err = api.GetMountpaths(baseParams)
 	tutils.CheckFatal(err, t)
 
 	if len(mountpaths.Available) != len(oldMountpaths.Available) {
@@ -1232,7 +1216,7 @@ func TestAddAndRemoveMountpath(t *testing.T) {
 	}
 
 	// Put and read random files
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -1254,7 +1238,6 @@ func TestLocalRebalanceAfterAddingMountpath(t *testing.T) {
 	const (
 		num          = 5000
 		filesize     = 1024
-		seed         = int64(111)
 		maxErrPct    = 0
 		newMountpath = "/tmp/dfc"
 	)
@@ -1286,7 +1269,7 @@ func TestLocalRebalanceAfterAddingMountpath(t *testing.T) {
 	if m.originalTargetCount < 1 {
 		t.Fatalf("Must have 1 or more targets in the cluster, have only %d", m.originalTargetCount)
 	}
-	targets := extractTargetsInfo(m.smap)
+	target := extractTargetNodes(m.smap)[0]
 
 	// Create local bucket
 	createFreshLocalBucket(t, m.proxyURL, m.bucket)
@@ -1297,7 +1280,7 @@ func TestLocalRebalanceAfterAddingMountpath(t *testing.T) {
 	}()
 
 	// Put random files
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -1306,7 +1289,8 @@ func TestLocalRebalanceAfterAddingMountpath(t *testing.T) {
 	}
 
 	// Add new mountpath to target
-	err = tutils.AddTargetMountpath(targets[0].directURL, newMountpath)
+	baseParams := tutils.BaseAPIParams(target.URL(cmn.NetworkPublic))
+	err = api.AddMountpath(baseParams, newMountpath)
 	tutils.CheckFatal(err, t)
 
 	waitForRebalanceToComplete(t, m.proxyURL)
@@ -1317,7 +1301,7 @@ func TestLocalRebalanceAfterAddingMountpath(t *testing.T) {
 	m.wg.Wait()
 
 	// Remove new mountpath from target
-	err = tutils.RemoveTargetMountpath(targets[0].directURL, newMountpath)
+	err = api.RemoveMountpath(baseParams, newMountpath)
 	tutils.CheckFatal(err, t)
 
 	resultsBeforeAfter(&m, num, maxErrPct)
@@ -1331,7 +1315,6 @@ func TestGlobalAndLocalRebalanceAfterAddingMountpath(t *testing.T) {
 	const (
 		num          = 10000
 		filesize     = 1024
-		seed         = int64(111)
 		maxErrPct    = 0
 		newMountpath = "/tmp/dfc/mountpath"
 	)
@@ -1363,18 +1346,20 @@ func TestGlobalAndLocalRebalanceAfterAddingMountpath(t *testing.T) {
 	if m.originalTargetCount < 1 {
 		t.Fatalf("Must have 1 or more targets in the cluster, have only %d", m.originalTargetCount)
 	}
-	targets := extractTargetsInfo(m.smap)
+	targets := extractTargetNodes(m.smap)
 
 	// Create local bucket
 	createFreshLocalBucket(t, m.proxyURL, m.bucket)
 
 	defer func() {
-		os.RemoveAll(newMountpath)
+		if !tutils.DockerRunning() {
+			os.RemoveAll(newMountpath)
+		}
 		destroyLocalBucket(t, m.proxyURL, m.bucket)
 	}()
 
 	// Put random files
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -1382,12 +1367,23 @@ func TestGlobalAndLocalRebalanceAfterAddingMountpath(t *testing.T) {
 		m.repFilenameCh <- repFile{repetitions: m.numGetsEachFile, filename: f}
 	}
 
-	// Add new mountpath to all targets
-	for idx, target := range targets {
-		mountpath := filepath.Join(newMountpath, fmt.Sprintf("%d", idx))
-		cmn.CreateDir(mountpath)
-		err = tutils.AddTargetMountpath(target.directURL, mountpath)
+	if tutils.DockerRunning() {
+		err = tutils.DockerCreateMpathDir(0, newMountpath)
 		tutils.CheckFatal(err, t)
+		for _, target := range targets {
+			baseParams := tutils.BaseAPIParams(target.URL(cmn.NetworkPublic))
+			err = api.AddMountpath(baseParams, newMountpath)
+			tutils.CheckFatal(err, t)
+		}
+	} else {
+		// Add new mountpath to all targets
+		for idx, target := range targets {
+			mountpath := filepath.Join(newMountpath, fmt.Sprintf("%d", idx))
+			cmn.CreateDir(mountpath)
+			baseParams := tutils.BaseAPIParams(target.URL(cmn.NetworkPublic))
+			err = api.AddMountpath(baseParams, mountpath)
+			tutils.CheckFatal(err, t)
+		}
 	}
 
 	waitForRebalanceToComplete(t, m.proxyURL)
@@ -1398,11 +1394,24 @@ func TestGlobalAndLocalRebalanceAfterAddingMountpath(t *testing.T) {
 	m.wg.Wait()
 
 	// Remove new mountpath from all targets
-	for idx, target := range targets {
-		mountpath := filepath.Join(newMountpath, fmt.Sprintf("%d", idx))
-		os.RemoveAll(mountpath)
-		err = tutils.RemoveTargetMountpath(target.directURL, mountpath)
+	if tutils.DockerRunning() {
+		err = tutils.DockerRemoveMpathDir(0, newMountpath)
 		tutils.CheckFatal(err, t)
+		for _, target := range targets {
+			baseParams := tutils.BaseAPIParams(target.URL(cmn.NetworkPublic))
+			if err = api.RemoveMountpath(baseParams, newMountpath); err != nil {
+				t.Error(err.Error())
+			}
+		}
+	} else {
+		for idx, target := range targets {
+			mountpath := filepath.Join(newMountpath, fmt.Sprintf("%d", idx))
+			os.RemoveAll(mountpath)
+			baseParams := tutils.BaseAPIParams(target.URL(cmn.NetworkPublic))
+			if err = api.RemoveMountpath(baseParams, mountpath); err != nil {
+				t.Error(err.Error())
+			}
+		}
 	}
 
 	resultsBeforeAfter(&m, num, maxErrPct)
@@ -1412,7 +1421,6 @@ func TestDisableAndEnableMountpath(t *testing.T) {
 	const (
 		num       = 5000
 		filesize  = 1024
-		seed      = int64(111)
 		maxErrPct = 0
 	)
 
@@ -1447,19 +1455,19 @@ func TestDisableAndEnableMountpath(t *testing.T) {
 	if m.originalTargetCount < 1 {
 		t.Fatalf("Must have 1 or more targets in the cluster, have only %d", m.originalTargetCount)
 	}
-	targets := extractTargetsInfo(m.smap)
-
+	target := extractTargetNodes(m.smap)[0]
+	baseParams := tutils.BaseAPIParams(target.URL(cmn.NetworkPublic))
 	// Remove all mountpaths for one target
-	oldMountpaths, err := tutils.TargetMountpaths(targets[0].directURL)
+	oldMountpaths, err := api.GetMountpaths(baseParams)
 	tutils.CheckFatal(err, t)
 
 	for _, mpath := range oldMountpaths.Available {
-		err = tutils.DisableTargetMountpath(targets[0].directURL, mpath)
+		err = api.DisableMountpath(baseParams, mpath)
 		tutils.CheckFatal(err, t)
 	}
 
 	// Check if mountpaths were actually disabled
-	mountpaths, err := tutils.TargetMountpaths(targets[0].directURL)
+	mountpaths, err := api.GetMountpaths(baseParams)
 	tutils.CheckFatal(err, t)
 
 	if len(mountpaths.Available) != 0 {
@@ -1476,12 +1484,12 @@ func TestDisableAndEnableMountpath(t *testing.T) {
 
 	// Add target mountpath again
 	for _, mpath := range oldMountpaths.Available {
-		err = tutils.EnableTargetMountpath(targets[0].directURL, mpath)
+		err = api.EnableMountpath(baseParams, mpath)
 		tutils.CheckFatal(err, t)
 	}
 
 	// Check if mountpaths were actually enabled
-	mountpaths, err = tutils.TargetMountpaths(targets[0].directURL)
+	mountpaths, err = api.GetMountpaths(baseParams)
 	tutils.CheckFatal(err, t)
 
 	if len(mountpaths.Available) != len(oldMountpaths.Available) {
@@ -1493,7 +1501,7 @@ func TestDisableAndEnableMountpath(t *testing.T) {
 	}
 
 	// Put and read random files
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -1543,7 +1551,7 @@ func doGetsInParallel(m *metadata) {
 				repFile.repetitions -= 1
 				m.repFilenameCh <- repFile
 			}
-			_, _, err := tutils.Get(m.proxyURL, m.bucket, SmokeStr+"/"+repFile.filename, nil, nil, false, false)
+			_, err := api.GetObject(tutils.DefaultBaseAPIParams(m.t), m.bucket, path.Join(SmokeStr, repFile.filename))
 			if err != nil {
 				r := atomic.LoadUint64(&(m.reregistered))
 				if r == 1 {
@@ -1567,15 +1575,15 @@ func doGetsInParallel(m *metadata) {
 	}
 }
 
-func extractTargetsInfo(smap cluster.Smap) []targetInfo {
-	var targets []targetInfo
-	for sid, daemon := range smap.Tmap {
-		targets = append(targets, targetInfo{sid: sid, directURL: daemon.PublicNet.DirectURL})
+func extractTargetNodes(smap cluster.Smap) []*cluster.Snode {
+	targets := []*cluster.Snode{}
+	for _, target := range smap.Tmap {
+		targets = append(targets, target)
 	}
 	return targets
 }
 
-func doReregisterTarget(target, targetDirectURL string, m *metadata) {
+func doReregisterTarget(target *cluster.Snode, m *metadata) {
 	const (
 		timeout    = time.Second * 10
 		interval   = time.Millisecond * 10
@@ -1583,21 +1591,21 @@ func doReregisterTarget(target, targetDirectURL string, m *metadata) {
 	)
 
 	// T1
-	tutils.Logf("Re-registering target %s...\n", target)
+	tutils.Logf("Re-registering target %s...\n", target.DaemonID)
 	smap := getClusterMap(m.t, m.proxyURL)
-	err := tutils.RegisterTarget(target, targetDirectURL, smap)
+	err := tutils.RegisterTarget(m.proxyURL, target, smap)
 	tutils.CheckFatal(err, m.t)
-
+	baseParams := tutils.BaseAPIParams(target.URL(cmn.NetworkPublic))
 	for i := 0; i < iterations; i++ {
 		time.Sleep(interval)
-		if _, ok := smap.Tmap[target]; !ok {
+		if _, ok := smap.Tmap[target.DaemonID]; !ok {
 			// T2
 			smap = getClusterMap(m.t, m.proxyURL)
-			if _, ok := smap.Tmap[target]; ok {
-				tutils.Logf("T2: re-registered target %s\n", target)
+			if _, ok := smap.Tmap[target.DaemonID]; ok {
+				tutils.Logf("T2: re-registered target %s\n", target.DaemonID)
 			}
 		} else {
-			lbNames, err := api.GetBucketNames(tutils.HTTPClient, targetDirectURL, true)
+			lbNames, err := api.GetBucketNames(baseParams, true)
 			tutils.CheckFatal(err, m.t)
 			// T3
 			if cmn.StringInSlice(m.bucket, lbNames.Local) {
@@ -1605,7 +1613,7 @@ func doReregisterTarget(target, targetDirectURL string, m *metadata) {
 				if !s {
 					m.t.Errorf("reregistered should have swapped from 0 to 1. Actual reregistered = %d\n", m.reregistered)
 				}
-				tutils.Logf("T3: re-registered target %s got updated with the new bucket-metadata\n", target)
+				tutils.Logf("T3: re-registered target %s got updated with the new bucket-metadata\n", target.DaemonID)
 				break
 			}
 		}
@@ -1613,10 +1621,8 @@ func doReregisterTarget(target, targetDirectURL string, m *metadata) {
 }
 
 func saveClusterState(m *metadata) {
-	var err error
 	m.proxyURL = getPrimaryURL(m.t, proxyURLRO)
-	m.smap, err = tutils.GetClusterMap(m.proxyURL)
-	tutils.CheckFatal(err, m.t)
+	m.smap = getClusterMap(m.t, m.proxyURL)
 	m.originalTargetCount = len(m.smap.Tmap)
 	m.originalProxyCount = len(m.smap.Pmap)
 	tutils.Logf("Number of targets %d, number of proxies %d\n", m.originalTargetCount, m.originalProxyCount)
@@ -1646,7 +1652,8 @@ func assertClusterState(m *metadata) {
 
 func createFreshLocalBucket(t *testing.T, proxyURL, bucketFQN string) {
 	destroyLocalBucket(t, proxyURL, bucketFQN)
-	err := api.CreateLocalBucket(tutils.HTTPClient, proxyURL, bucketFQN)
+	baseParams := tutils.BaseAPIParams(proxyURL)
+	err := api.CreateLocalBucket(baseParams, bucketFQN)
 	tutils.CheckFatal(err, t)
 }
 
@@ -1654,7 +1661,8 @@ func destroyLocalBucket(t *testing.T, proxyURL, bucket string) {
 	exists, err := tutils.DoesLocalBucketExist(proxyURL, bucket)
 	tutils.CheckFatal(err, t)
 	if exists {
-		err = api.DestroyLocalBucket(tutils.HTTPClient, proxyURL, bucket)
+		baseParams := tutils.BaseAPIParams(proxyURL)
+		err = api.DestroyLocalBucket(baseParams, bucket)
 		tutils.CheckFatal(err, t)
 	}
 }
@@ -1665,7 +1673,8 @@ func checkObjectDistribution(t *testing.T, m *metadata) {
 		targetObjectCount = make(map[string]int64)
 	)
 	tutils.Logf("Checking if each target has a required number of object in bucket %s...\n", m.bucket)
-	bucketList, err := tutils.ListBucket(m.proxyURL, m.bucket, &cmn.GetMsg{GetProps: cmn.GetTargetURL}, 0)
+	baseParams := tutils.BaseAPIParams(m.proxyURL)
+	bucketList, err := api.ListBucket(baseParams, m.bucket, &cmn.GetMsg{GetProps: cmn.GetTargetURL}, 0)
 	tutils.CheckFatal(err, t)
 	for _, obj := range bucketList.Entries {
 		targetObjectCount[obj.TargetURL] += 1
@@ -1725,7 +1734,7 @@ func TestForwardCP(t *testing.T) {
 
 	// Step 3.
 	tutils.Logf("PUT %d objects into bucket %s...\n", num, m.bucket)
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
@@ -1761,7 +1770,6 @@ func TestAtimeRebalance(t *testing.T) {
 	const (
 		num      = 50
 		filesize = 1024
-		seed     = int64(141)
 	)
 
 	var (
@@ -1799,14 +1807,14 @@ func TestAtimeRebalance(t *testing.T) {
 
 	// Enable bucket level LRU properties
 	bucketProps.LRUEnabled = true
-	err = api.SetBucketProps(tutils.HTTPClient, m.proxyURL, m.bucket, bucketProps)
+	err = api.SetBucketProps(tutils.DefaultBaseAPIParams(t), m.bucket, bucketProps)
 	tutils.CheckFatal(err, t)
 
-	target := extractTargetsInfo(m.smap)[0]
+	target := extractTargetNodes(m.smap)[0]
 
 	// Unregister a target
-	tutils.Logf("Trying to unregister target: %s\n", target.directURL)
-	err = tutils.UnregisterTarget(m.proxyURL, target.sid)
+	tutils.Logf("Trying to unregister target: %s\n", target.URL(cmn.NetworkPublic))
+	err = tutils.UnregisterTarget(m.proxyURL, target.DaemonID)
 	tutils.CheckFatal(err, t)
 	smap, err := waitForPrimaryProxy(
 		m.proxyURL,
@@ -1818,13 +1826,14 @@ func TestAtimeRebalance(t *testing.T) {
 	tutils.CheckFatal(err, t)
 
 	// Put random files
-	putRandObjs(m.proxyURL, seed, filesize, num, m.bucket, errCh, filenameCh, SmokeDir, SmokeStr, true, sgl)
+	tutils.PutRandObjs(m.proxyURL, m.bucket, SmokeDir, readerType, SmokeStr, filesize, num, errCh, filenameCh, sgl)
 	selectErr(errCh, "put", t, false)
 	close(filenameCh)
 	close(errCh)
-	objNames := make(map[string]string, 0)
+	objNames := make(cmn.SimpleKVs, 10)
 	msg := &cmn.GetMsg{GetProps: cmn.GetPropsAtime + ", " + cmn.GetPropsStatus}
-	bucketList, err := tutils.ListBucket(m.proxyURL, m.bucket, msg, 0)
+	baseParams := tutils.BaseAPIParams(m.proxyURL)
+	bucketList, err := api.ListBucket(baseParams, m.bucket, msg, 0)
 	tutils.CheckFatal(err, t)
 
 	for _, entry := range bucketList.Entries {
@@ -1832,7 +1841,7 @@ func TestAtimeRebalance(t *testing.T) {
 	}
 
 	// register a new target
-	err = tutils.RegisterTarget(target.sid, target.directURL, m.smap)
+	err = tutils.RegisterTarget(m.proxyURL, target, m.smap)
 	tutils.CheckFatal(err, t)
 
 	// make sure that the cluster has all targets enabled
@@ -1847,7 +1856,7 @@ func TestAtimeRebalance(t *testing.T) {
 
 	waitForRebalanceToComplete(t, m.proxyURL)
 
-	bucketListReb, err := tutils.ListBucket(m.proxyURL, m.bucket, msg, 0)
+	bucketListReb, err := api.ListBucket(baseParams, m.bucket, msg, 0)
 	tutils.CheckFatal(err, t)
 
 	itemCount := 0
