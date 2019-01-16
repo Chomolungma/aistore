@@ -26,5 +26,5 @@ cd $GOPATH/src
 go get -v github.com/NVIDIA/dfcpub/dfc
 cd $DFCSRC
 BUILD=`git rev-parse --short HEAD`
-go build && go install && GOBIN=$GOPATH/bin go install -ldflags "-X github.com/NVIDIA/dfcpub/dfc.build=$BUILD" setup/dfc.go
+go build && go install && GOBIN=$GOPATH/bin go install -tags="${CLDPROVIDER}" -ldflags "-X github.com/NVIDIA/dfcpub/dfc.build=$BUILD" setup/dfc.go
 
