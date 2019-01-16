@@ -5,7 +5,7 @@ sudo touch /etc/profile.d/dfcpaths.sh
 sudo sh -c "echo export PATH=$PATH:/usr/local/go/bin > /etc/profile.d/dfcpaths.sh"
 sudo sh -c "echo export GOBIN=$HOME/dfc/bin >> /etc/profile.d/dfcpaths.sh"
 sudo sh -c "echo export GOPATH=$HOME/dfc/ >> /etc/profile.d/dfcpaths.sh"
-sudo sh -c "echo export DFCSRC=$HOME/dfc/src/github.com/NVIDIA/dfcpub/dfc >> /etc/profile.d/dfcpaths.sh"
+sudo sh -c "echo export DFCSRC=$HOME/dfc/src/github.com/NVIDIA/dfcpub/ais >> /etc/profile.d/dfcpaths.sh"
 sudo chmod 777 /etc/profile.d/dfcpaths.sh
 . /etc/profile.d/dfcpaths.sh
 rm -rf ~/dfc || true
