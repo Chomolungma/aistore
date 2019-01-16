@@ -2,7 +2,7 @@
 set -e
 . /etc/profile.d/dfcpaths.sh
 echo 'Pull latest DFC'
-cd $HOME/dfc/src/github.com/NVIDIA/dfcpub
+cd $DFCSRC
 git fetch
 git reset --hard origin/master
 git status
