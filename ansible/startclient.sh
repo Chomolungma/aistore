@@ -17,7 +17,7 @@ cleanup='false'
 while getopts ":b:p:d:m:x:t:n:c:" opt; do
     case $opt in
         b)
-            bucket=$OPTARG
+            bucket=`hostname`$OPTARG
             echo "Using bucket $bucket"
             ;;
         p)
